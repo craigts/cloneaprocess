@@ -4,12 +4,27 @@ import ApplicationServices
 #endif
 import Foundation
 
+@objc protocol EventSinkXPC {
+    func onEvent(_ event: [String: Any])
+}
+
 @objc protocol RecorderServiceXPC {
     func ping(_ reply: @escaping (String) -> Void)
     func getPermissions(_ reply: @escaping ([String: Bool]) -> Void)
+    func beginCapture(_ config: [String: Any], reply: @escaping ([String: Any]) -> Void)
+    func endCapture(_ sessionId: String, reply: @escaping ([String: Any]) -> Void)
+    func subscribeEvents(_ reply: @escaping ([String: Any]) -> Void)
+    func unsubscribeEvents(_ reply: @escaping ([String: Any]) -> Void)
 }
 
 final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
+    private var captureSessionId: String?
+    private var captureStartedAtMs: UInt64?
+    private var emittedEventCount: UInt64 = 0
+    private var eventTapPort: CFMachPort?
+    private var eventTapRunLoopSource: CFRunLoopSource?
+    private weak var subscriberConnection: NSXPCConnection?
+
     func ping(_ reply: @escaping (String) -> Void) {
         reply("pong")
     }
@@ -21,6 +36,201 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         ]
 
         reply(permissions)
+    }
+
+    func beginCapture(_ config: [String: Any], reply: @escaping ([String: Any]) -> Void) {
+        _ = config
+
+        guard captureSessionId == nil else {
+            reply([
+                "ok": false,
+                "error": "capture_already_active",
+            ])
+            return
+        }
+
+        let sessionId = "sess_\(UUID().uuidString.lowercased())"
+        captureSessionId = sessionId
+        captureStartedAtMs = nowMs()
+        emittedEventCount = 0
+
+        let tapStarted = startEventTap()
+        reply([
+            "ok": tapStarted,
+            "session_id": sessionId,
+            "started_at": captureStartedAtMs ?? nowMs(),
+            "error": tapStarted ? NSNull() : "event_tap_start_failed",
+        ])
+    }
+
+    func endCapture(_ sessionId: String, reply: @escaping ([String: Any]) -> Void) {
+        guard captureSessionId == sessionId else {
+            reply([
+                "ok": false,
+                "error": "unknown_session",
+            ])
+            return
+        }
+
+        stopEventTap()
+        let endedAt = nowMs()
+
+        reply([
+            "ok": true,
+            "session_id": sessionId,
+            "started_at": captureStartedAtMs ?? endedAt,
+            "ended_at": endedAt,
+            "event_count": emittedEventCount,
+        ])
+
+        captureSessionId = nil
+        captureStartedAtMs = nil
+        emittedEventCount = 0
+    }
+
+    func subscribeEvents(_ reply: @escaping ([String: Any]) -> Void) {
+        guard let connection = NSXPCConnection.current() else {
+            reply([
+                "ok": false,
+                "error": "no_current_connection",
+            ])
+            return
+        }
+
+        connection.remoteObjectInterface = NSXPCInterface(with: EventSinkXPC.self)
+        subscriberConnection = connection
+        reply([
+            "ok": true,
+        ])
+    }
+
+    func unsubscribeEvents(_ reply: @escaping ([String: Any]) -> Void) {
+        subscriberConnection = nil
+        reply([
+            "ok": true,
+        ])
+    }
+
+    private func startEventTap() -> Bool {
+        #if canImport(ApplicationServices)
+        guard eventTapPort == nil else { return true }
+
+        let mask =
+            (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)
+            | (1 << CGEventType.leftMouseDown.rawValue)
+            | (1 << CGEventType.leftMouseUp.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseUp.rawValue)
+            | (1 << CGEventType.mouseMoved.rawValue)
+            | (1 << CGEventType.leftMouseDragged.rawValue)
+            | (1 << CGEventType.rightMouseDragged.rawValue)
+
+        let observer = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(mask),
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                let service = Unmanaged<RecorderServiceImpl>.fromOpaque(userInfo).takeUnretainedValue()
+                service.handle(event: event, type: type)
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: observer
+        ) else {
+            return false
+        }
+
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            return false
+        }
+
+        eventTapPort = tap
+        eventTapRunLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    private func stopEventTap() {
+        #if canImport(ApplicationServices)
+        if let tap = eventTapPort {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+
+        if let source = eventTapRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+
+        eventTapRunLoopSource = nil
+        eventTapPort = nil
+        #endif
+    }
+
+    private func handle(event: CGEvent, type: CGEventType) {
+        guard captureSessionId != nil else { return }
+
+        let location = event.location
+        let eventType = mapEventType(type)
+        guard !eventType.isEmpty else { return }
+
+        emittedEventCount += 1
+        var payload: [String: Any] = [
+            "id": "evt_\(UUID().uuidString.lowercased())",
+            "ts": nowMs(),
+            "type": eventType,
+            "payload": [
+                "x": location.x,
+                "y": location.y,
+            ],
+        ]
+
+        if type == .keyDown || type == .keyUp {
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            payload["payload"] = [
+                "key_code": keyCode,
+                "x": location.x,
+                "y": location.y,
+            ]
+        }
+
+        emitEvent(payload)
+    }
+
+    private func emitEvent(_ event: [String: Any]) {
+        guard let connection = subscriberConnection else { return }
+
+        guard let sink = connection.remoteObjectProxy as? EventSinkXPC else {
+            return
+        }
+
+        sink.onEvent(event)
+    }
+
+    private func mapEventType(_ type: CGEventType) -> String {
+        switch type {
+        case .keyDown: return "key_down"
+        case .keyUp: return "key_up"
+        case .leftMouseDown: return "mouse_down"
+        case .leftMouseUp: return "mouse_up"
+        case .rightMouseDown: return "mouse_down"
+        case .rightMouseUp: return "mouse_up"
+        case .mouseMoved: return "mouse_move"
+        case .leftMouseDragged: return "mouse_drag"
+        case .rightMouseDragged: return "mouse_drag"
+        default: return ""
+        }
+    }
+
+    private func nowMs() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970 * 1000)
     }
 
     private func isAccessibilityGranted() -> Bool {
@@ -44,7 +254,8 @@ final class RecorderServiceDelegate: NSObject, NSXPCListenerDelegate {
     private let exportedObject = RecorderServiceImpl()
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
-        newConnection.exportedInterface = NSXPCInterface(with: RecorderServiceXPC.self)
+        let interface = NSXPCInterface(with: RecorderServiceXPC.self)
+        newConnection.exportedInterface = interface
         newConnection.exportedObject = exportedObject
         newConnection.resume()
         return true
