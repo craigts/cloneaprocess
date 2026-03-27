@@ -3,6 +3,18 @@
 import ApplicationServices
 #endif
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+#if canImport(ImageIO)
+import ImageIO
+#endif
+#if canImport(UniformTypeIdentifiers)
+import UniformTypeIdentifiers
+#endif
+#if canImport(ScreenCaptureKit)
+import ScreenCaptureKit
+#endif
 
 @objc protocol EventSinkXPC {
     func onEvent(_ event: [String: Any])
@@ -21,9 +33,12 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private var captureSessionId: String?
     private var captureStartedAtMs: UInt64?
     private var emittedEventCount: UInt64 = 0
+    private var emittedFrameCount: UInt64 = 0
     private var eventTapPort: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
     private var subscriberConnectionByAuditToken: [Data: NSXPCConnection] = [:]
+    private var frameOutputDirectoryURL: URL?
+    private let frameCaptureQueue = DispatchQueue(label: "com.cloneaprocess.recorder.frame-capture")
 
     func ping(_ reply: @escaping (String) -> Void) {
         reply("pong")
@@ -57,10 +72,32 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             return
         }
 
+        guard isScreenRecordingGranted() else {
+            reply([
+                "ok": false,
+                "error": "screen_recording_not_granted",
+            ])
+            return
+        }
+
         let sessionId = "sess_\(UUID().uuidString.lowercased())"
+        let frameDirectoryURL = frameDirectory(for: sessionId)
+
+        do {
+            try FileManager.default.createDirectory(at: frameDirectoryURL, withIntermediateDirectories: true)
+        } catch {
+            reply([
+                "ok": false,
+                "error": "frame_directory_create_failed",
+            ])
+            return
+        }
+
         captureSessionId = sessionId
         captureStartedAtMs = nowMs()
         emittedEventCount = 0
+        emittedFrameCount = 0
+        frameOutputDirectoryURL = frameDirectoryURL
 
         let tapStarted = startEventTap()
         reply([
@@ -89,11 +126,14 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             "started_at": captureStartedAtMs ?? endedAt,
             "ended_at": endedAt,
             "event_count": emittedEventCount,
+            "frame_count": emittedFrameCount,
         ])
 
         captureSessionId = nil
         captureStartedAtMs = nil
         emittedEventCount = 0
+        emittedFrameCount = 0
+        frameOutputDirectoryURL = nil
     }
 
     func subscribeEvents(_ eventSink: NSXPCListenerEndpoint, reply: @escaping ([String: Any]) -> Void) {
@@ -231,6 +271,133 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         ]
 
         emitEvent(envelope)
+
+        if shouldCaptureKeyframe(for: type) {
+            captureAndEmitKeyframe()
+        }
+    }
+
+    private func shouldCaptureKeyframe(for eventType: CGEventType) -> Bool {
+        switch eventType {
+        case .leftMouseDown, .rightMouseDown, .keyDown:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func captureAndEmitKeyframe() {
+        guard let sessionId = captureSessionId else { return }
+        guard let outputDirectoryURL = frameOutputDirectoryURL else { return }
+
+        frameCaptureQueue.async { [weak self] in
+            guard let self else { return }
+
+            let frameId = "frm_\(UUID().uuidString.lowercased())"
+            let frameURL = outputDirectoryURL.appendingPathComponent("\(frameId).jpg")
+
+            guard let screenshotData = self.captureScreenshotJPEGData() else { return }
+
+            do {
+                try screenshotData.write(to: frameURL, options: .atomic)
+            } catch {
+                return
+            }
+
+            self.emittedFrameCount += 1
+            let frameEvent: [String: Any] = [
+                "v": 1,
+                "id": "evt_\(UUID().uuidString.lowercased())",
+                "ts": self.nowMs(),
+                "type": "screen_frame",
+                "payload": [
+                    "session_id": sessionId,
+                    "frame_id": frameId,
+                    "path": frameURL.path,
+                ],
+            ]
+
+            self.emitEvent(frameEvent)
+        }
+    }
+
+    private func captureScreenshotJPEGData() -> Data? {
+        #if canImport(ScreenCaptureKit)
+        if #available(macOS 14.0, *) {
+            return captureScreenshotJPEGDataWithScreenCaptureKit()
+        }
+        #endif
+
+        #if canImport(ApplicationServices)
+        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else {
+            return nil
+        }
+
+        return jpegData(from: image)
+        #else
+        return nil
+        #endif
+    }
+
+    #if canImport(ScreenCaptureKit)
+    @available(macOS 14.0, *)
+    private func captureScreenshotJPEGDataWithScreenCaptureKit() -> Data? {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Data?
+
+        Task {
+            defer { semaphore.signal() }
+            do {
+                let content = try await SCShareableContent.current
+                guard let display = content.displays.first else { return }
+
+                let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+                let configuration = SCStreamConfiguration()
+                configuration.width = display.width
+                configuration.height = display.height
+                configuration.showsCursor = true
+
+                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+                result = jpegData(from: image)
+            } catch {
+                result = nil
+            }
+        }
+
+        semaphore.wait()
+        return result
+    }
+    #endif
+
+    private func jpegData(from image: CGImage) -> Data? {
+        #if canImport(ImageIO)
+        let data = NSMutableData()
+        #if canImport(UniformTypeIdentifiers)
+        let jpegType = UTType.jpeg.identifier as CFString
+        #else
+        let jpegType = "public.jpeg" as CFString
+        #endif
+
+        guard let destination = CGImageDestinationCreateWithData(data, jpegType, 1, nil) else {
+            return nil
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+
+        return data as Data
+        #else
+        return nil
+        #endif
+    }
+
+    private func frameDirectory(for sessionId: String) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("cloneaprocess-recordings", isDirectory: true)
+            .appendingPathComponent(sessionId, isDirectory: true)
+            .appendingPathComponent("frames", isDirectory: true)
     }
 
     private func emitEvent(_ event: [String: Any]) {
