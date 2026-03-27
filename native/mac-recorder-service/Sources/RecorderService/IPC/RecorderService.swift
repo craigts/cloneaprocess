@@ -13,7 +13,7 @@ import Foundation
     func getPermissions(_ reply: @escaping ([String: Bool]) -> Void)
     func beginCapture(_ config: [String: Any], reply: @escaping ([String: Any]) -> Void)
     func endCapture(_ sessionId: String, reply: @escaping ([String: Any]) -> Void)
-    func subscribeEvents(_ reply: @escaping ([String: Any]) -> Void)
+    func subscribeEvents(_ eventSink: NSXPCListenerEndpoint, reply: @escaping ([String: Any]) -> Void)
     func unsubscribeEvents(_ reply: @escaping ([String: Any]) -> Void)
 }
 
@@ -23,7 +23,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private var emittedEventCount: UInt64 = 0
     private var eventTapPort: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
-    private weak var subscriberConnection: NSXPCConnection?
+    private var subscriberConnectionByAuditToken: [Data: NSXPCConnection] = [:]
 
     func ping(_ reply: @escaping (String) -> Void) {
         reply("pong")
@@ -45,6 +45,14 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             reply([
                 "ok": false,
                 "error": "capture_already_active",
+            ])
+            return
+        }
+
+        guard isAccessibilityGranted() else {
+            reply([
+                "ok": false,
+                "error": "accessibility_not_granted",
             ])
             return
         }
@@ -88,7 +96,30 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         emittedEventCount = 0
     }
 
-    func subscribeEvents(_ reply: @escaping ([String: Any]) -> Void) {
+    func subscribeEvents(_ eventSink: NSXPCListenerEndpoint, reply: @escaping ([String: Any]) -> Void) {
+        guard let callerConnection = NSXPCConnection.current() else {
+            reply([
+                "ok": false,
+                "error": "no_current_connection",
+            ])
+            return
+        }
+
+        let sinkConnection = NSXPCConnection(listenerEndpoint: eventSink)
+        sinkConnection.remoteObjectInterface = NSXPCInterface(with: EventSinkXPC.self)
+        sinkConnection.invalidationHandler = { [weak self, weak callerConnection] in
+            guard let self, let callerConnection else { return }
+            self.subscriberConnectionByAuditToken.removeValue(forKey: callerConnection.auditTokenData)
+        }
+        sinkConnection.resume()
+
+        subscriberConnectionByAuditToken[callerConnection.auditTokenData] = sinkConnection
+        reply([
+            "ok": true,
+        ])
+    }
+
+    func unsubscribeEvents(_ reply: @escaping ([String: Any]) -> Void) {
         guard let connection = NSXPCConnection.current() else {
             reply([
                 "ok": false,
@@ -97,15 +128,15 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             return
         }
 
-        connection.remoteObjectInterface = NSXPCInterface(with: EventSinkXPC.self)
-        subscriberConnection = connection
-        reply([
-            "ok": true,
-        ])
-    }
+        guard let sinkConnection = subscriberConnectionByAuditToken.removeValue(forKey: connection.auditTokenData) else {
+            reply([
+                "ok": false,
+                "error": "not_subscribed",
+            ])
+            return
+        }
 
-    func unsubscribeEvents(_ reply: @escaping ([String: Any]) -> Void) {
-        subscriberConnection = nil
+        sinkConnection.invalidate()
         reply([
             "ok": true,
         ])
@@ -115,7 +146,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         #if canImport(ApplicationServices)
         guard eventTapPort == nil else { return true }
 
-        let mask =
+        let mouseAndKeyboardEventsMask =
             (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.leftMouseDown.rawValue)
@@ -132,7 +163,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .listenOnly,
-            eventsOfInterest: CGEventMask(mask),
+            eventsOfInterest: CGEventMask(mouseAndKeyboardEventsMask),
             callback: { _, type, event, userInfo in
                 guard let userInfo else { return Unmanaged.passUnretained(event) }
                 let service = Unmanaged<RecorderServiceImpl>.fromOpaque(userInfo).takeUnretainedValue()
@@ -183,35 +214,33 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
         emittedEventCount += 1
         var payload: [String: Any] = [
-            "id": "evt_\(UUID().uuidString.lowercased())",
-            "ts": nowMs(),
-            "type": eventType,
-            "payload": [
-                "x": location.x,
-                "y": location.y,
-            ],
+            "x": location.x,
+            "y": location.y,
         ]
 
         if type == .keyDown || type == .keyUp {
-            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            payload["payload"] = [
-                "key_code": keyCode,
-                "x": location.x,
-                "y": location.y,
-            ]
+            payload["key_code"] = event.getIntegerValueField(.keyboardEventKeycode)
         }
 
-        emitEvent(payload)
+        let envelope: [String: Any] = [
+            "v": 1,
+            "id": "evt_\(UUID().uuidString.lowercased())",
+            "ts": nowMs(),
+            "type": eventType,
+            "payload": payload,
+        ]
+
+        emitEvent(envelope)
     }
 
     private func emitEvent(_ event: [String: Any]) {
-        guard let connection = subscriberConnection else { return }
+        for connection in subscriberConnectionByAuditToken.values {
+            guard let sink = connection.remoteObjectProxy as? EventSinkXPC else {
+                continue
+            }
 
-        guard let sink = connection.remoteObjectProxy as? EventSinkXPC else {
-            return
+            sink.onEvent(event)
         }
-
-        sink.onEvent(event)
     }
 
     private func mapEventType(_ type: CGEventType) -> String {
@@ -250,11 +279,48 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     }
 }
 
+private extension NSXPCConnection {
+    var auditTokenData: Data {
+        withUnsafeBytes(of: auditToken) { Data($0) }
+    }
+}
+
 final class RecorderServiceDelegate: NSObject, NSXPCListenerDelegate {
     private let exportedObject = RecorderServiceImpl()
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         let interface = NSXPCInterface(with: RecorderServiceXPC.self)
+        interface.setClasses(
+            [NSDictionary.self, NSString.self, NSNumber.self, NSNull.self],
+            for: #selector(RecorderServiceXPC.beginCapture(_:reply:)),
+            argumentIndex: 0,
+            ofReply: false
+        )
+        interface.setClasses(
+            [NSDictionary.self, NSString.self, NSNumber.self, NSNull.self],
+            for: #selector(RecorderServiceXPC.beginCapture(_:reply:)),
+            argumentIndex: 0,
+            ofReply: true
+        )
+        interface.setClasses(
+            [NSDictionary.self, NSString.self, NSNumber.self, NSNull.self],
+            for: #selector(RecorderServiceXPC.endCapture(_:reply:)),
+            argumentIndex: 0,
+            ofReply: true
+        )
+        interface.setClasses(
+            [NSDictionary.self, NSString.self, NSNumber.self],
+            for: #selector(RecorderServiceXPC.subscribeEvents(_:reply:)),
+            argumentIndex: 0,
+            ofReply: true
+        )
+        interface.setClasses(
+            [NSDictionary.self, NSString.self, NSNumber.self],
+            for: #selector(RecorderServiceXPC.unsubscribeEvents(_:)),
+            argumentIndex: 0,
+            ofReply: true
+        )
+
         newConnection.exportedInterface = interface
         newConnection.exportedObject = exportedObject
         newConnection.resume()
