@@ -292,6 +292,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
         frameCaptureQueue.async { [weak self] in
             guard let self else { return }
+            guard self.isCaptureSessionActive(sessionId: sessionId, outputDirectoryURL: outputDirectoryURL) else { return }
 
             let frameId = "frm_\(UUID().uuidString.lowercased())"
             let frameURL = outputDirectoryURL.appendingPathComponent("\(frameId).jpg")
@@ -303,6 +304,8 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             } catch {
                 return
             }
+
+            guard self.isCaptureSessionActive(sessionId: sessionId, outputDirectoryURL: outputDirectoryURL) else { return }
 
             self.emittedFrameCount += 1
             let frameEvent: [String: Any] = [
@@ -319,6 +322,10 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
             self.emitEvent(frameEvent)
         }
+    }
+
+    private func isCaptureSessionActive(sessionId: String, outputDirectoryURL: URL) -> Bool {
+        captureSessionId == sessionId && frameOutputDirectoryURL == outputDirectoryURL
     }
 
     private func captureScreenshotJPEGData() -> Data? {
