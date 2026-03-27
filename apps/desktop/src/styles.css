@@ -1,0 +1,176 @@
+:root {
+  color: #132630;
+  background:
+    radial-gradient(circle at top left, rgba(253, 222, 184, 0.9), transparent 26%),
+    radial-gradient(circle at top right, rgba(154, 217, 226, 0.75), transparent 28%),
+    linear-gradient(180deg, #f7f3eb 0%, #ece5d8 48%, #e6dfd3 100%);
+  font-family: 'Iowan Old Style', 'Palatino Linotype', serif;
+  line-height: 1.4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.shell {
+  width: min(1080px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 4rem 0 3rem;
+  display: grid;
+  gap: 1.5rem;
+}
+
+.hero,
+.panel {
+  border: 1px solid rgba(19, 38, 48, 0.12);
+  background: rgba(255, 252, 245, 0.78);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 24px 80px rgba(33, 44, 48, 0.08);
+}
+
+.hero {
+  padding: 2rem;
+  border-radius: 28px;
+}
+
+.hero h1 {
+  margin: 0;
+  max-width: 12ch;
+  font-size: clamp(2.7rem, 7vw, 5.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.05em;
+}
+
+.eyebrow,
+.panel-kicker {
+  margin: 0 0 0.5rem;
+  color: #7b5f3b;
+  font-family: 'Avenir Next', 'Helvetica Neue', sans-serif;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.lede {
+  margin: 1rem 0 0;
+  max-width: 48rem;
+  font-size: 1.15rem;
+  color: rgba(19, 38, 48, 0.8);
+}
+
+.panel {
+  padding: 1.5rem;
+  border-radius: 24px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 1.7rem;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.45rem 0.85rem;
+  background: #173443;
+  color: #f8fbff;
+  font-family: 'Avenir Next', 'Helvetica Neue', sans-serif;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.status-pill--warning {
+  background: #9a5a1b;
+}
+
+.status-grid {
+  margin: 1.5rem 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.status-grid div {
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.status-grid dt {
+  margin: 0 0 0.45rem;
+  color: rgba(19, 38, 48, 0.62);
+  font-family: 'Avenir Next', 'Helvetica Neue', sans-serif;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.status-grid dd {
+  margin: 0;
+  font-size: 1rem;
+  word-break: break-word;
+}
+
+.loading,
+.note {
+  margin: 1rem 0 0;
+  color: rgba(19, 38, 48, 0.7);
+}
+
+.roadmap {
+  margin: 1rem 0 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.roadmap li::marker {
+  color: #7b5f3b;
+}
+
+@media (max-width: 720px) {
+  .shell {
+    width: min(100% - 1rem, 1080px);
+    padding-top: 1rem;
+  }
+
+  .hero,
+  .panel {
+    border-radius: 22px;
+  }
+
+  .panel-header {
+    flex-direction: column;
+  }
+}
+

@@ -1,0 +1,38 @@
+{
+  "name": "cloneaprocess",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "24"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "profile": "minimal"
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "postCreateCommand": "npm install",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "bradlc.vscode-tailwindcss"
+      ],
+      "settings": {
+        "files.trimTrailingWhitespace": true,
+        "editor.formatOnSave": true,
+        "typescript.tsdk": "node_modules/typescript/lib"
+      }
+    }
+  },
+  "remoteEnv": {
+    "CARGO_TARGET_DIR": "${containerWorkspaceFolder}/.cargo-target"
+  },
+  "mounts": [
+    "source=cloneaprocess-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=cloneaprocess-cargo-git,target=/usr/local/cargo/git,type=volume",
+    "source=cloneaprocess-node-modules,target=${containerWorkspaceFolder}/node_modules,type=volume"
+  ]
+}
