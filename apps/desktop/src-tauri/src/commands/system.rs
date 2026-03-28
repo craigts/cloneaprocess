@@ -17,6 +17,8 @@ pub struct SystemStatus {
     raw_event_count: i64,
     storage_schema_version: u32,
     workflow_ir_version: u32,
+    recorder_binary: String,
+    recorder_permissions: std::collections::BTreeMap<String, bool>,
 }
 
 #[tauri::command]
@@ -30,6 +32,12 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         .storage()
         .raw_event_count()
         .map_err(|error| error.to_string())?;
+    let recorder_status = state
+        .recorder()
+        .lock()
+        .map_err(|_| "recorder mutex poisoned".to_string())?
+        .status()
+        .map_err(|error| error.to_string())?;
 
     Ok(SystemStatus {
         app_version: env!("CARGO_PKG_VERSION"),
@@ -41,5 +49,7 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         raw_event_count,
         storage_schema_version: storage_status.schema_version,
         workflow_ir_version: WORKFLOW_IR_VERSION,
+        recorder_binary: recorder_status.recorder_binary,
+        recorder_permissions: recorder_status.permissions,
     })
 }

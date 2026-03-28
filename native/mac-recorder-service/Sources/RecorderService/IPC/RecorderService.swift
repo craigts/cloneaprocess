@@ -44,6 +44,30 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         reply("pong")
     }
 
+    func bridgeAccessibilityGranted() -> Bool {
+        isAccessibilityGranted()
+    }
+
+    func bridgeScreenRecordingGranted() -> Bool {
+        isScreenRecordingGranted()
+    }
+
+    func bridgeBeginCapture(config: [String: Any], reply: @escaping ([String: Any]) -> Void) {
+        beginCapture(config, reply: reply)
+    }
+
+    func bridgeEndCapture(reply: @escaping ([String: Any]) -> Void) {
+        guard let sessionId = captureSessionId else {
+            reply([
+                "ok": false,
+                "error": "no_active_session",
+            ])
+            return
+        }
+
+        endCapture(sessionId, reply: reply)
+    }
+
     func getPermissions(_ reply: @escaping ([String: Bool]) -> Void) {
         let permissions: [String: Bool] = [
             "accessibility": isAccessibilityGranted(),
@@ -379,6 +403,8 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
             sink.onEvent(event)
         }
+
+        RecorderBridgeEmitter.shared.emit(event)
     }
 
     private func mapEventType(_ type: CGEventType) -> String {
@@ -478,6 +504,18 @@ struct RecorderService {
         listener.delegate = delegate
         listener.resume()
         RunLoop.main.run()
+    }
+}
+
+enum RecorderBridgeEmitter {
+    static let shared = RecorderBridgeEmitterState()
+}
+
+final class RecorderBridgeEmitterState: @unchecked Sendable {
+    var handler: (([String: Any]) -> Void)?
+
+    func emit(_ event: [String: Any]) {
+        handler?(event)
     }
 }
 #else

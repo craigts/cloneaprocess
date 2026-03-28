@@ -1,15 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
 
+use crate::core::recorder::RecorderCoordinator;
 use crate::storage::{Storage, StorageError};
 
 pub struct AppState {
     started_at_ms: u64,
     recordings_root: PathBuf,
     storage: Storage,
+    recorder: Mutex<RecorderCoordinator>,
 }
 
 impl AppState {
@@ -23,6 +26,13 @@ impl AppState {
             .map_err(|source| StorageError::io(recordings_root.clone(), source))?;
 
         let storage = Storage::bootstrap(app_data_dir.join("storage").join("cloneaprocess.sqlite3"))?;
+        let recorder_binary = app
+            .path()
+            .resolve(
+                "../../native/mac-recorder-service/.build/debug/RecorderService",
+                tauri::path::BaseDirectory::Resource,
+            )
+            .unwrap_or_else(|_| PathBuf::from("native/mac-recorder-service/.build/debug/RecorderService"));
 
         Ok(Self {
             started_at_ms: SystemTime::now()
@@ -30,6 +40,7 @@ impl AppState {
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0),
             recordings_root,
+            recorder: Mutex::new(RecorderCoordinator::new(storage.clone(), recorder_binary)),
             storage,
         })
     }
@@ -44,5 +55,9 @@ impl AppState {
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    pub fn recorder(&self) -> &Mutex<RecorderCoordinator> {
+        &self.recorder
     }
 }
