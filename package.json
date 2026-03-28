@@ -10,7 +10,7 @@
     "dev": "npm run dev --workspace @cloneaprocess/desktop",
     "build": "npm run build --workspace @cloneaprocess/desktop",
     "tauri:dev": "npm run tauri:dev --workspace @cloneaprocess/desktop",
-    "tauri:build": "npm run tauri:build --workspace @cloneaprocess/desktop"
+    "tauri:build": "npm run tauri:build --workspace @cloneaprocess/desktop",
+    "desktop:run": "bash ./scripts/run-desktop.sh"
   }
 }
-

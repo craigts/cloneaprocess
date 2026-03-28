@@ -16,3 +16,17 @@ The repo includes a GitHub Codespaces / devcontainer setup in `.devcontainer/`.
 
 - Use Codespaces for TypeScript, Rust, schema, docs, and Git work.
 - Use a Mac for native Swift services, Accessibility, ScreenCaptureKit, and end-to-end automation verification.
+
+## Local Run
+
+From the repo root, use:
+
+```bash
+npm run desktop:run
+```
+
+That command:
+
+- incrementally builds `native/mac-recorder-service`
+- incrementally builds `native/mac-runner-service`
+- launches the Tauri desktop app via `tauri dev`
