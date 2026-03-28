@@ -9,6 +9,7 @@ type BackendStatus = {
   startedAtMs: number
   sessionCount: number
   rawEventCount: number
+  keyframeCount: number
   storageSchemaVersion: number
   workflowIrVersion: number
   recorderBinary: string
@@ -62,6 +63,7 @@ const browserFallbackStatus: BackendStatus = {
   startedAtMs: 0,
   sessionCount: 0,
   rawEventCount: 0,
+  keyframeCount: 0,
   storageSchemaVersion: 1,
   workflowIrVersion: 1,
   recorderBinary: './native/mac-recorder-service/.build/debug/RecorderService',
@@ -203,6 +205,10 @@ export function App() {
             <div>
               <dt>Raw events</dt>
               <dd>{status.rawEventCount}</dd>
+            </div>
+            <div>
+              <dt>Keyframes</dt>
+              <dd>{status.keyframeCount}</dd>
             </div>
           </dl>
         ) : (

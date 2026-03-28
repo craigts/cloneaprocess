@@ -15,6 +15,7 @@ pub struct SystemStatus {
     started_at_ms: u64,
     session_count: i64,
     raw_event_count: i64,
+    keyframe_count: i64,
     storage_schema_version: u32,
     workflow_ir_version: u32,
     recorder_binary: String,
@@ -32,6 +33,10 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         .storage()
         .raw_event_count()
         .map_err(|error| error.to_string())?;
+    let keyframe_count = state
+        .storage()
+        .keyframe_count()
+        .map_err(|error| error.to_string())?;
     let recorder_status = state
         .recorder()
         .lock()
@@ -47,6 +52,7 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         started_at_ms: state.started_at_ms(),
         session_count,
         raw_event_count,
+        keyframe_count,
         storage_schema_version: storage_status.schema_version,
         workflow_ir_version: WORKFLOW_IR_VERSION,
         recorder_binary: recorder_status.recorder_binary,

@@ -110,6 +110,14 @@ pub struct NewRawEvent {
     pub recorded_at_ms: u64,
 }
 
+#[derive(Debug)]
+pub struct NewKeyframe {
+    pub session_id: i64,
+    pub frame_id: String,
+    pub relative_path: String,
+    pub sha256: Option<String>,
+}
+
 impl Storage {
     pub fn bootstrap(db_path: PathBuf) -> Result<Self, StorageError> {
         if let Some(parent) = db_path.parent() {
@@ -184,6 +192,34 @@ impl Storage {
         Ok(connection.last_insert_rowid())
     }
 
+    pub fn insert_keyframe(&self, keyframe: &NewKeyframe) -> Result<i64, StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            INSERT INTO keyframes (
+                session_id,
+                frame_id,
+                relative_path,
+                sha256,
+                created_at_ms
+            ) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )?;
+
+        statement.bind_int64(1, keyframe.session_id)?;
+        statement.bind_text(2, &keyframe.frame_id)?;
+        statement.bind_text(3, &keyframe.relative_path)?;
+        if let Some(sha256) = &keyframe.sha256 {
+            statement.bind_text(4, sha256)?;
+        } else {
+            statement.bind_null(4)?;
+        }
+        statement.bind_int64(5, now_ms() as i64)?;
+        statement.execute()?;
+
+        Ok(connection.last_insert_rowid())
+    }
+
     pub fn session_count(&self) -> Result<i64, StorageError> {
         let connection = self.open_connection()?;
         let statement = connection.prepare("SELECT COUNT(*) FROM sessions")?;
@@ -193,6 +229,12 @@ impl Storage {
     pub fn raw_event_count(&self) -> Result<i64, StorageError> {
         let connection = self.open_connection()?;
         let statement = connection.prepare("SELECT COUNT(*) FROM raw_events")?;
+        Ok(statement.query_int64()?.unwrap_or(0))
+    }
+
+    pub fn keyframe_count(&self) -> Result<i64, StorageError> {
+        let connection = self.open_connection()?;
+        let statement = connection.prepare("SELECT COUNT(*) FROM keyframes")?;
         Ok(statement.query_int64()?.unwrap_or(0))
     }
 
@@ -293,7 +335,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{NewRawEvent, NewSession, Storage};
+    use super::{NewKeyframe, NewRawEvent, NewSession, Storage};
 
     #[test]
     fn bootstraps_schema_and_inserts_records() {
@@ -335,6 +377,17 @@ mod tests {
             .expect("events should load");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "frontmost_app_changed");
+
+        let keyframe_id = storage
+            .insert_keyframe(&NewKeyframe {
+                session_id,
+                frame_id: "frm_smoke".to_string(),
+                relative_path: "recordings/sess_smoke/frames/frm_smoke.jpg".to_string(),
+                sha256: None,
+            })
+            .expect("keyframe insert should succeed");
+        assert!(keyframe_id > 0, "keyframe row id should be positive");
+        assert_eq!(storage.keyframe_count().expect("keyframe count should load"), 1);
 
         let _ = fs::remove_dir_all(&root);
     }

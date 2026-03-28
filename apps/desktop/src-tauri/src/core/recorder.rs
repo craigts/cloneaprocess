@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{NewRawEvent, NewSession, Storage, StorageError};
+use crate::storage::{NewKeyframe, NewRawEvent, NewSession, Storage, StorageError};
 
 #[derive(Debug)]
 pub enum RecorderError {
@@ -325,11 +325,27 @@ fn spawn_ingest_thread(
             state_guard.next_sequence += 1;
             state_guard.event_count += 1;
             if event_type == "screen_frame" {
+                if let Some(keyframe) = extract_keyframe(&message.payload, state_guard.session_row_id) {
+                    let _ = storage.insert_keyframe(&keyframe);
+                }
                 state_guard.frame_count += 1;
             }
         }
 
         Ok(())
+    })
+}
+
+fn extract_keyframe(payload: &serde_json::Value, session_id: i64) -> Option<NewKeyframe> {
+    let event_payload = payload.get("payload")?.as_object()?;
+    let frame_id = event_payload.get("frame_id")?.as_str()?.to_string();
+    let relative_path = event_payload.get("path")?.as_str()?.to_string();
+
+    Some(NewKeyframe {
+        session_id,
+        frame_id,
+        relative_path,
+        sha256: None,
     })
 }
 
