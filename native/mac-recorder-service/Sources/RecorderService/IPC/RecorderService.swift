@@ -36,7 +36,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private var emittedFrameCount: UInt64 = 0
     private var eventTapPort: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
-    private var subscriberConnectionByAuditToken: [Data: NSXPCConnection] = [:]
+    private var subscriberConnectionByIdentifier: [ObjectIdentifier: NSXPCConnection] = [:]
     private var frameOutputDirectoryURL: URL?
     private let frameCaptureQueue = DispatchQueue(label: "com.cloneaprocess.recorder.frame-capture")
 
@@ -149,11 +149,11 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         sinkConnection.remoteObjectInterface = NSXPCInterface(with: EventSinkXPC.self)
         sinkConnection.invalidationHandler = { [weak self, weak callerConnection] in
             guard let self, let callerConnection else { return }
-            self.subscriberConnectionByAuditToken.removeValue(forKey: callerConnection.auditTokenData)
+            self.subscriberConnectionByIdentifier.removeValue(forKey: ObjectIdentifier(callerConnection))
         }
         sinkConnection.resume()
 
-        subscriberConnectionByAuditToken[callerConnection.auditTokenData] = sinkConnection
+        subscriberConnectionByIdentifier[ObjectIdentifier(callerConnection)] = sinkConnection
         reply([
             "ok": true,
         ])
@@ -168,7 +168,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             return
         }
 
-        guard let sinkConnection = subscriberConnectionByAuditToken.removeValue(forKey: connection.auditTokenData) else {
+        guard let sinkConnection = subscriberConnectionByIdentifier.removeValue(forKey: ObjectIdentifier(connection)) else {
             reply([
                 "ok": false,
                 "error": "not_subscribed",
@@ -329,54 +329,18 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     }
 
     private func captureScreenshotJPEGData() -> Data? {
-        #if canImport(ScreenCaptureKit)
-        if #available(macOS 14.0, *) {
-            return captureScreenshotJPEGDataWithScreenCaptureKit()
-        }
-        #endif
-
         #if canImport(ApplicationServices)
         guard let image = CGDisplayCreateImage(CGMainDisplayID()) else {
             return nil
         }
 
-        return jpegData(from: image)
+        return Self.jpegData(from: image)
         #else
         return nil
         #endif
     }
 
-    #if canImport(ScreenCaptureKit)
-    @available(macOS 14.0, *)
-    private func captureScreenshotJPEGDataWithScreenCaptureKit() -> Data? {
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: Data?
-
-        Task {
-            defer { semaphore.signal() }
-            do {
-                let content = try await SCShareableContent.current
-                guard let display = content.displays.first else { return }
-
-                let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-                let configuration = SCStreamConfiguration()
-                configuration.width = display.width
-                configuration.height = display.height
-                configuration.showsCursor = true
-
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-                result = jpegData(from: image)
-            } catch {
-                result = nil
-            }
-        }
-
-        semaphore.wait()
-        return result
-    }
-    #endif
-
-    private func jpegData(from image: CGImage) -> Data? {
+    private static func jpegData(from image: CGImage) -> Data? {
         #if canImport(ImageIO)
         let data = NSMutableData()
         #if canImport(UniformTypeIdentifiers)
@@ -408,7 +372,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     }
 
     private func emitEvent(_ event: [String: Any]) {
-        for connection in subscriberConnectionByAuditToken.values {
+        for connection in subscriberConnectionByIdentifier.values {
             guard let sink = connection.remoteObjectProxy as? EventSinkXPC else {
                 continue
             }
@@ -453,43 +417,39 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     }
 }
 
-private extension NSXPCConnection {
-    var auditTokenData: Data {
-        withUnsafeBytes(of: auditToken) { Data($0) }
-    }
-}
-
 final class RecorderServiceDelegate: NSObject, NSXPCListenerDelegate {
     private let exportedObject = RecorderServiceImpl()
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         let interface = NSXPCInterface(with: RecorderServiceXPC.self)
+        let objectClasses = xpcAllowedClasses([NSDictionary.self, NSString.self, NSNumber.self, NSNull.self])
+        let replyClasses = xpcAllowedClasses([NSDictionary.self, NSString.self, NSNumber.self])
         interface.setClasses(
-            [NSDictionary.self, NSString.self, NSNumber.self, NSNull.self],
+            objectClasses,
             for: #selector(RecorderServiceXPC.beginCapture(_:reply:)),
             argumentIndex: 0,
             ofReply: false
         )
         interface.setClasses(
-            [NSDictionary.self, NSString.self, NSNumber.self, NSNull.self],
+            objectClasses,
             for: #selector(RecorderServiceXPC.beginCapture(_:reply:)),
             argumentIndex: 0,
             ofReply: true
         )
         interface.setClasses(
-            [NSDictionary.self, NSString.self, NSNumber.self, NSNull.self],
+            objectClasses,
             for: #selector(RecorderServiceXPC.endCapture(_:reply:)),
             argumentIndex: 0,
             ofReply: true
         )
         interface.setClasses(
-            [NSDictionary.self, NSString.self, NSNumber.self],
+            replyClasses,
             for: #selector(RecorderServiceXPC.subscribeEvents(_:reply:)),
             argumentIndex: 0,
             ofReply: true
         )
         interface.setClasses(
-            [NSDictionary.self, NSString.self, NSNumber.self],
+            replyClasses,
             for: #selector(RecorderServiceXPC.unsubscribeEvents(_:)),
             argumentIndex: 0,
             ofReply: true
@@ -500,6 +460,10 @@ final class RecorderServiceDelegate: NSObject, NSXPCListenerDelegate {
         newConnection.resume()
         return true
     }
+}
+
+private func xpcAllowedClasses(_ classes: [AnyClass]) -> Set<AnyHashable> {
+    Set(classes.map { AnyHashable(ObjectIdentifier($0)) })
 }
 
 struct RecorderService {
