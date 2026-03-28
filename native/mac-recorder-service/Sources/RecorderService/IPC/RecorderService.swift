@@ -3,6 +3,9 @@
 import ApplicationServices
 #endif
 import Foundation
+#if canImport(AppKit)
+import AppKit
+#endif
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
@@ -296,8 +299,21 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
         emitEvent(envelope)
 
+        if shouldCaptureAXSnapshot(for: type) {
+            emitAXSnapshot(at: location)
+        }
+
         if shouldCaptureKeyframe(for: type) {
             captureAndEmitKeyframe()
+        }
+    }
+
+    private func shouldCaptureAXSnapshot(for eventType: CGEventType) -> Bool {
+        switch eventType {
+        case .leftMouseDown, .rightMouseDown:
+            return true
+        default:
+            return false
         }
     }
 
@@ -346,6 +362,152 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
             self.emitEvent(frameEvent)
         }
+    }
+
+    private func emitAXSnapshot(at location: CGPoint) {
+        #if canImport(ApplicationServices)
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var resolvedElement: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(
+            systemWideElement,
+            Float(location.x),
+            Float(location.y),
+            &resolvedElement
+        )
+
+        guard result == .success else { return }
+        guard let element = resolvedElement else { return }
+        guard let snapshotPayload = axSnapshotPayload(for: element, location: location) else { return }
+
+        let snapshotEvent: [String: Any] = [
+            "v": 1,
+            "id": "evt_\(UUID().uuidString.lowercased())",
+            "ts": nowMs(),
+            "type": "ax_snapshot",
+            "payload": snapshotPayload,
+        ]
+
+        emitEvent(snapshotEvent)
+        #endif
+    }
+
+    private func axSnapshotPayload(for element: AXUIElement, location: CGPoint) -> [String: Any]? {
+        #if canImport(ApplicationServices)
+        let role = axStringAttribute(kAXRoleAttribute as CFString, from: element)
+        let subrole = axStringAttribute(kAXSubroleAttribute as CFString, from: element)
+        let title = preferredAXTitle(for: element)
+        let description = axStringAttribute(kAXDescriptionAttribute as CFString, from: element)
+
+        if role == nil && title == nil && description == nil {
+            return nil
+        }
+
+        var pid: pid_t = 0
+        let pidResult = AXUIElementGetPid(element, &pid)
+        let bundleIdentifier: String?
+        if pidResult == .success, pid > 0 {
+            #if canImport(AppKit)
+            bundleIdentifier = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+            #else
+            bundleIdentifier = nil
+            #endif
+        } else {
+            bundleIdentifier = nil
+        }
+
+        var selectorAX: [String: Any] = [:]
+        if let role {
+            selectorAX["role"] = role
+        }
+        if let subrole {
+            selectorAX["subrole"] = subrole
+        }
+        if let title {
+            selectorAX["title"] = title
+        }
+        if let description {
+            selectorAX["description"] = description
+        }
+
+        var selector: [String: Any] = [:]
+        if let bundleIdentifier {
+            selector["target_app"] = ["bundle_id": bundleIdentifier]
+        }
+        if !selectorAX.isEmpty {
+            selector["ax"] = selectorAX
+        }
+
+        var payload: [String: Any] = [
+            "snapshot_id": "ax_\(UUID().uuidString.lowercased())",
+            "x": location.x,
+            "y": location.y,
+        ]
+
+        if let bundleIdentifier {
+            payload["bundle_id"] = bundleIdentifier
+        }
+        if let role {
+            payload["role"] = role
+        }
+        if let subrole {
+            payload["subrole"] = subrole
+        }
+        if let title {
+            payload["title"] = title
+        }
+        if let description {
+            payload["description"] = description
+        }
+        if !selector.isEmpty {
+            payload["selector"] = selector
+        }
+
+        return payload
+        #else
+        return nil
+        #endif
+    }
+
+    private func preferredAXTitle(for element: AXUIElement) -> String? {
+        #if canImport(ApplicationServices)
+        if let title = axStringAttribute(kAXTitleAttribute as CFString, from: element), !title.isEmpty {
+            return title
+        }
+        if let description = axStringAttribute(kAXDescriptionAttribute as CFString, from: element), !description.isEmpty {
+            return description
+        }
+        if let value = axStringAttribute(kAXValueAttribute as CFString, from: element), !value.isEmpty {
+            return value
+        }
+        return nil
+        #else
+        return nil
+        #endif
+    }
+
+    private func axStringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
+        #if canImport(ApplicationServices)
+        var rawValue: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &rawValue)
+        guard result == .success else { return nil }
+        guard let rawValue else { return nil }
+
+        if CFGetTypeID(rawValue) == CFStringGetTypeID() {
+            return rawValue as? String
+        }
+
+        if let attributedValue = rawValue as? NSAttributedString {
+            return attributedValue.string
+        }
+
+        if let number = rawValue as? NSNumber {
+            return number.stringValue
+        }
+
+        return nil
+        #else
+        return nil
+        #endif
     }
 
     private func isCaptureSessionActive(sessionId: String, outputDirectoryURL: URL) -> Bool {
