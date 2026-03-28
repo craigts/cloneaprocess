@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-compile-workflow-preview"
+description = "Enables the compile_workflow_preview command without any pre-configured scope."
+commands.allow = ["compile_workflow_preview"]

@@ -85,6 +85,10 @@ select {
   border-radius: 24px;
 }
 
+.timeline-panel {
+  overflow: hidden;
+}
+
 .panel-header {
   display: flex;
   justify-content: space-between;
@@ -141,6 +145,117 @@ select {
   word-break: break-word;
 }
 
+.actions {
+  margin-top: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.actions button,
+.session-card {
+  border: 1px solid rgba(19, 38, 48, 0.14);
+  background: rgba(255, 255, 255, 0.72);
+  color: #132630;
+  border-radius: 16px;
+  padding: 0.8rem 1rem;
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.actions button:hover,
+.session-card:hover,
+.session-card--active {
+  transform: translateY(-1px);
+  border-color: rgba(23, 52, 67, 0.35);
+  box-shadow: 0 12px 32px rgba(33, 44, 48, 0.08);
+}
+
+.timeline-layout {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.session-list {
+  display: grid;
+  gap: 0.75rem;
+  align-content: start;
+}
+
+.session-card {
+  display: grid;
+  gap: 0.25rem;
+  text-align: left;
+}
+
+.session-card__title {
+  font-weight: 700;
+}
+
+.session-card__meta {
+  color: rgba(19, 38, 48, 0.72);
+  font-size: 0.88rem;
+}
+
+.timeline-view {
+  min-width: 0;
+}
+
+.timeline-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  margin-bottom: 1rem;
+  color: rgba(19, 38, 48, 0.78);
+}
+
+.timeline-events {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.timeline-event {
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.timeline-event__header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+  font-family: 'Avenir Next', 'Helvetica Neue', sans-serif;
+  font-size: 0.88rem;
+}
+
+.timeline-event__frame {
+  display: block;
+  width: min(100%, 420px);
+  margin-bottom: 0.75rem;
+  border-radius: 14px;
+  border: 1px solid rgba(19, 38, 48, 0.12);
+}
+
+.timeline-event__payload {
+  margin: 0;
+  overflow-x: auto;
+  padding: 0.9rem;
+  border-radius: 14px;
+  background: rgba(19, 38, 48, 0.05);
+  font-family: 'SFMono-Regular', 'Menlo', monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.workflow-preview {
+  margin-top: 1rem;
+  min-height: 280px;
+}
+
 .loading,
 .note {
   margin: 1rem 0 0;
@@ -172,5 +287,8 @@ select {
   .panel-header {
     flex-direction: column;
   }
-}
 
+  .timeline-layout {
+    grid-template-columns: 1fr;
+  }
+}

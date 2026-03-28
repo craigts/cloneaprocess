@@ -71,6 +71,28 @@ pub struct StorageStatus {
     pub schema_version: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionRecord {
+    pub id: i64,
+    pub external_id: String,
+    pub label: Option<String>,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub status: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RawEventRecord {
+    pub id: i64,
+    pub session_id: i64,
+    pub sequence: i64,
+    pub event_type: String,
+    pub event_json: String,
+    pub recorded_at_ms: u64,
+    pub created_at_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct NewSession {
     pub external_id: String,
@@ -174,6 +196,72 @@ impl Storage {
         Ok(statement.query_int64()?.unwrap_or(0))
     }
 
+    pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionRecord>, StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, external_id, label, started_at_ms, ended_at_ms, status, created_at_ms
+            FROM sessions
+            ORDER BY started_at_ms DESC, id DESC
+            LIMIT ?
+            "#,
+        )?;
+        statement.bind_int64(1, limit)?;
+
+        let mut rows = Vec::new();
+        while statement.step()? {
+            rows.push(SessionRecord {
+                id: statement.column_int64(0),
+                external_id: statement.column_text(1)?.unwrap_or_default(),
+                label: statement.column_text(2)?,
+                started_at_ms: statement.column_int64(3) as u64,
+                ended_at_ms: if statement.column_is_null(4) {
+                    None
+                } else {
+                    Some(statement.column_int64(4) as u64)
+                },
+                status: statement.column_text(5)?.unwrap_or_default(),
+                created_at_ms: statement.column_int64(6) as u64,
+            });
+        }
+
+        Ok(rows)
+    }
+
+    pub fn list_raw_events_for_session(
+        &self,
+        session_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RawEventRecord>, StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, session_id, seq, event_type, event_json, recorded_at_ms, created_at_ms
+            FROM raw_events
+            WHERE session_id = ?
+            ORDER BY seq ASC, id ASC
+            LIMIT ?
+            "#,
+        )?;
+        statement.bind_int64(1, session_id)?;
+        statement.bind_int64(2, limit)?;
+
+        let mut rows = Vec::new();
+        while statement.step()? {
+            rows.push(RawEventRecord {
+                id: statement.column_int64(0),
+                session_id: statement.column_int64(1),
+                sequence: statement.column_int64(2),
+                event_type: statement.column_text(3)?.unwrap_or_default(),
+                event_json: statement.column_text(4)?.unwrap_or_default(),
+                recorded_at_ms: statement.column_int64(5) as u64,
+                created_at_ms: statement.column_int64(6) as u64,
+            });
+        }
+
+        Ok(rows)
+    }
+
     fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.open_connection()?;
         connection.exec_batch(BOOTSTRAP_SQL)?;
@@ -237,6 +325,16 @@ mod tests {
         assert!(event_id > 0, "raw event row id should be positive");
         assert_eq!(storage.session_count().expect("session count should load"), 1);
         assert_eq!(storage.raw_event_count().expect("raw event count should load"), 1);
+
+        let sessions = storage.list_sessions(10).expect("sessions should load");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].external_id, "sess_smoke");
+
+        let events = storage
+            .list_raw_events_for_session(session_id, 10)
+            .expect("events should load");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "frontmost_app_changed");
 
         let _ = fs::remove_dir_all(&root);
     }

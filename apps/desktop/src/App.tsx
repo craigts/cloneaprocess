@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { useEffect, useMemo, useState } from 'react'
+import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core'
 
 type BackendStatus = {
   appVersion: string
@@ -25,6 +25,35 @@ type RecorderStatus = {
   recorderBinary: string
 }
 
+type SessionSummary = {
+  id: number
+  externalId: string
+  label: string | null
+  startedAtMs: number
+  endedAtMs: number | null
+  status: string
+  createdAtMs: number
+}
+
+type TimelineEvent = {
+  id: number
+  sessionId: number
+  sequence: number
+  eventType: string
+  eventJson: string
+  recordedAtMs: number
+  createdAtMs: number
+}
+
+type WorkflowDraft = {
+  workflowJson: string
+  stepCount: number
+}
+
+type ParsedEventPayload = {
+  payload?: Record<string, unknown>
+}
+
 const browserFallbackStatus: BackendStatus = {
   appVersion: 'browser-preview',
   platform: 'browser',
@@ -42,63 +71,99 @@ const browserFallbackStatus: BackendStatus = {
 export function App() {
   const [status, setStatus] = useState<BackendStatus | null>(null)
   const [recorder, setRecorder] = useState<RecorderStatus | null>(null)
+  const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
+  const [events, setEvents] = useState<TimelineEvent[]>([])
+  const [workflowDraft, setWorkflowDraft] = useState<WorkflowDraft | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [timelineError, setTimelineError] = useState<string | null>(null)
 
   useEffect(() => {
-    let cancelled = false
+    void refreshAll()
+  }, [])
 
-    invoke<BackendStatus>('system_status')
+  useEffect(() => {
+    if (selectedSessionId == null) {
+      setEvents([])
+      return
+    }
+
+    invoke<TimelineEvent[]>('list_session_events', { sessionId: selectedSessionId, limit: 250 })
       .then((response) => {
-        if (!cancelled) {
-          setStatus(response)
-          setError(null)
-        }
+        setEvents(response)
+        setTimelineError(null)
       })
       .catch((err) => {
-        if (!cancelled) {
-          setStatus(browserFallbackStatus)
-          setError(String(err))
-        }
+        setEvents([])
+        setTimelineError(String(err))
       })
 
-    invoke<RecorderStatus>('recorder_status')
+    invoke<WorkflowDraft>('compile_workflow_preview', { sessionId: selectedSessionId })
       .then((response) => {
-        if (!cancelled) {
-          setRecorder(response)
-        }
+        setWorkflowDraft(response)
       })
       .catch(() => {
-        if (!cancelled) {
-          setRecorder(null)
-        }
+        setWorkflowDraft(null)
       })
+  }, [selectedSessionId])
 
-    return () => {
-      cancelled = true
+  async function refreshAll(preferredSessionId?: number | null) {
+    try {
+      const [systemStatus, recorderStatus, sessionRows] = await Promise.all([
+        invoke<BackendStatus>('system_status'),
+        invoke<RecorderStatus>('recorder_status'),
+        invoke<SessionSummary[]>('list_sessions', { limit: 20 }),
+      ])
+
+      setStatus(systemStatus)
+      setRecorder(recorderStatus)
+      setSessions(sessionRows)
+      setError(null)
+
+      const nextSelection =
+        preferredSessionId ??
+        selectedSessionId ??
+        recorderStatus.sessionRowId ??
+        sessionRows[0]?.id ??
+        null
+
+      setSelectedSessionId(nextSelection)
+    } catch (err) {
+      setStatus(browserFallbackStatus)
+      setRecorder(null)
+      setSessions([])
+      setSelectedSessionId(null)
+      setEvents([])
+      setWorkflowDraft(null)
+      setError(String(err))
     }
-  }, [])
+  }
 
   async function handleRecorderAction(command: 'start_recording' | 'stop_recording') {
     try {
       const recorderStatus = await invoke<RecorderStatus>(command)
       setRecorder(recorderStatus)
       setActionError(null)
-      const systemStatus = await invoke<BackendStatus>('system_status')
-      setStatus(systemStatus)
+      await refreshAll(recorderStatus.sessionRowId)
     } catch (err) {
       setActionError(String(err))
     }
   }
 
+  const selectedSession = useMemo(
+    () => sessions.find((session) => session.id === selectedSessionId) ?? null,
+    [selectedSessionId, sessions],
+  )
+
   return (
     <main className="shell">
       <section className="hero">
         <p className="eyebrow">macOS-first automation workbench</p>
-        <h1>Clone a desktop workflow before we teach it to run.</h1>
+        <h1>Record first. Inspect what actually landed.</h1>
         <p className="lede">
-          This shell is wired to the first Rust command path and is ready for recorder,
-          workflow, and runner surfaces to land on top.
+          The app now surfaces recorder status, saved sessions, and the raw event timeline that
+          is currently being persisted into SQLite.
         </p>
       </section>
 
@@ -132,24 +197,12 @@ export function App() {
               <dd>{status.databasePath}</dd>
             </div>
             <div>
-              <dt>Started</dt>
-              <dd>{new Date(status.startedAtMs).toISOString()}</dd>
-            </div>
-            <div>
               <dt>Sessions</dt>
               <dd>{status.sessionCount}</dd>
             </div>
             <div>
               <dt>Raw events</dt>
               <dd>{status.rawEventCount}</dd>
-            </div>
-            <div>
-              <dt>Storage schema</dt>
-              <dd>v{status.storageSchemaVersion}</dd>
-            </div>
-            <div>
-              <dt>Workflow IR</dt>
-              <dd>v{status.workflowIrVersion}</dd>
             </div>
           </dl>
         ) : (
@@ -163,7 +216,7 @@ export function App() {
         <header className="panel-header">
           <div>
             <p className="panel-kicker">Recorder bridge</p>
-            <h2>Event ingest</h2>
+            <h2>Capture controls</h2>
           </div>
           <span className={`status-pill ${recorder?.active ? '' : 'status-pill--warning'}`}>
             {recorder?.active ? 'recording' : 'idle'}
@@ -176,6 +229,9 @@ export function App() {
           </button>
           <button type="button" onClick={() => void handleRecorderAction('stop_recording')}>
             Stop recording
+          </button>
+          <button type="button" onClick={() => void refreshAll(selectedSessionId)}>
+            Refresh timeline
           </button>
         </div>
 
@@ -213,20 +269,111 @@ export function App() {
         {actionError ? <p className="note">{actionError}</p> : null}
       </section>
 
-      <section className="panel panel--roadmap">
+      <section className="panel timeline-panel">
         <header className="panel-header">
           <div>
-            <p className="panel-kicker">Next surfaces</p>
-            <h2>Implementation track</h2>
+            <p className="panel-kicker">Recorded sessions</p>
+            <h2>Timeline</h2>
           </div>
+          <span className="status-pill">{sessions.length} loaded</span>
         </header>
 
-        <ul className="roadmap">
-          <li>Permissions onboarding with recorder and runner availability checks.</li>
-          <li>Session timeline with keyframes stored on disk and indexed in SQLite.</li>
-          <li>Workflow draft panel backed by semantic action compilation.</li>
-        </ul>
+        <div className="timeline-layout">
+          <aside className="session-list">
+            {sessions.length === 0 ? (
+              <p className="loading">No sessions stored yet.</p>
+            ) : (
+              sessions.map((session) => (
+                <button
+                  key={session.id}
+                  type="button"
+                  className={`session-card ${session.id === selectedSessionId ? 'session-card--active' : ''}`}
+                  onClick={() => setSelectedSessionId(session.id)}
+                >
+                  <span className="session-card__title">{session.label ?? session.externalId}</span>
+                  <span className="session-card__meta">#{session.id}</span>
+                  <span className="session-card__meta">{formatTimestamp(session.startedAtMs)}</span>
+                  <span className="session-card__meta">{session.status}</span>
+                </button>
+              ))
+            )}
+          </aside>
+
+          <div className="timeline-view">
+            {selectedSession ? (
+              <div className="timeline-summary">
+                <strong>{selectedSession.label ?? selectedSession.externalId}</strong>
+                <span>{formatTimestamp(selectedSession.startedAtMs)}</span>
+                <span>{events.length} events loaded</span>
+              </div>
+            ) : (
+              <p className="loading">Select a session to inspect events.</p>
+            )}
+
+            {timelineError ? <p className="note">{timelineError}</p> : null}
+
+            <div className="timeline-events">
+              {events.map((event) => (
+                <TimelineEventCard key={event.id} event={event} />
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <header className="panel-header">
+          <div>
+            <p className="panel-kicker">Workflow draft</p>
+            <h2>Compiler v0</h2>
+          </div>
+          <span className="status-pill">{workflowDraft?.stepCount ?? 0} steps</span>
+        </header>
+
+        {workflowDraft ? (
+          <pre className="timeline-event__payload workflow-preview">{workflowDraft.workflowJson}</pre>
+        ) : (
+          <p className="loading">Select a session with AX snapshots to generate a workflow draft.</p>
+        )}
       </section>
     </main>
   )
+}
+
+function TimelineEventCard({ event }: { event: TimelineEvent }) {
+  const parsed = parseEventJson(event.eventJson)
+  const payload = parsed.payload ?? {}
+  const framePath = typeof payload.path === 'string' ? payload.path : null
+  const imageSrc =
+    framePath && isTauri()
+      ? convertFileSrc(framePath)
+      : framePath
+
+  return (
+    <article className="timeline-event">
+      <div className="timeline-event__header">
+        <strong>{event.eventType}</strong>
+        <span>seq {event.sequence}</span>
+        <span>{formatTimestamp(event.recordedAtMs)}</span>
+      </div>
+
+      {imageSrc ? (
+        <img className="timeline-event__frame" src={imageSrc} alt={`Keyframe for ${event.eventType}`} />
+      ) : null}
+
+      <pre className="timeline-event__payload">{JSON.stringify(payload, null, 2)}</pre>
+    </article>
+  )
+}
+
+function parseEventJson(value: string): ParsedEventPayload {
+  try {
+    return JSON.parse(value) as ParsedEventPayload
+  } catch {
+    return {}
+  }
+}
+
+function formatTimestamp(timestamp: number) {
+  return new Date(timestamp).toLocaleString()
 }

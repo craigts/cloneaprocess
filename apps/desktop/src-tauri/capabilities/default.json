@@ -11,6 +11,9 @@
     "allow-recorder-status",
     "allow-start-recording",
     "allow-stop-recording",
-    "allow-storage-smoke-test"
+    "allow-storage-smoke-test",
+    "allow-list-sessions",
+    "allow-list-session-events",
+    "allow-compile-workflow-preview"
   ]
 }

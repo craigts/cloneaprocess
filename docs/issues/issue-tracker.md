@@ -12,5 +12,5 @@ This is the initial tracked issue list to start implementation. Status values ar
 | ISSUE-006 | ScreenCaptureKit keyframes | DONE | Capture keyframes on interaction and store them on disk; emit `screen_frame` events with path. | ISSUE-004 | Keyframe files are created and events reference valid paths. |
 | ISSUE-007 | AX snapshot on click | DONE | Capture AX element at cursor and emit snapshot + selector hints. | ISSUE-005 | Clicking a UI element results in an `ax_snapshot` event with role and title. |
 | ISSUE-008 | Rust event ingest | IN PROGRESS | Implement XPC client in Rust and persist incoming events to SQLite. | ISSUE-003, ISSUE-004 | Events are persisted in arrival order with timestamps. |
-| ISSUE-009 | UI timeline | OPEN | Build React timeline for raw events and keyframes with session list. | ISSUE-002, ISSUE-008 | UI renders a session timeline and loads keyframes from disk paths. |
-| ISSUE-010 | Semantic action compiler v0 | OPEN | Convert raw events to semantic actions and draft workflow JSON. | ISSUE-008 | A workflow JSON preview appears in the UI for a recorded session. |
+| ISSUE-009 | UI timeline | DONE | Build React timeline for raw events and keyframes with session list. | ISSUE-002, ISSUE-008 | UI renders a session timeline and loads keyframes from disk paths. |
+| ISSUE-010 | Semantic action compiler v0 | DONE | Convert raw events to semantic actions and draft workflow JSON. | ISSUE-008 | A workflow JSON preview appears in the UI for a recorded session. |

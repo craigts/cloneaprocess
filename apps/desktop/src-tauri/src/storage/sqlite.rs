@@ -53,7 +53,11 @@ unsafe extern "C" {
     fn sqlite3_finalize(statement: *mut Sqlite3Statement) -> c_int;
     fn sqlite3_last_insert_rowid(db: *mut Sqlite3) -> i64;
     fn sqlite3_column_int64(statement: *mut Sqlite3Statement, column: c_int) -> i64;
+    fn sqlite3_column_text(statement: *mut Sqlite3Statement, column: c_int) -> *const c_char;
+    fn sqlite3_column_type(statement: *mut Sqlite3Statement, column: c_int) -> c_int;
 }
+
+const SQLITE_NULL: c_int = 5;
 
 fn sqlite_transient() -> SqliteDestructor {
     unsafe { std::mem::transmute::<isize, SqliteDestructor>(-1_isize) }
@@ -221,6 +225,41 @@ impl<'db> Statement<'db> {
             SQLITE_DONE => Ok(None),
             _ => Err(self.db.last_error(rc)),
         }
+    }
+
+    pub fn step(&mut self) -> Result<bool, StorageError> {
+        let rc = unsafe { sqlite3_step(self.raw.as_ptr()) };
+        match rc {
+            SQLITE_ROW => Ok(true),
+            SQLITE_DONE => Ok(false),
+            _ => Err(self.db.last_error(rc)),
+        }
+    }
+
+    pub fn column_int64(&self, column: i32) -> i64 {
+        unsafe { sqlite3_column_int64(self.raw.as_ptr(), column) }
+    }
+
+    pub fn column_is_null(&self, column: i32) -> bool {
+        unsafe { sqlite3_column_type(self.raw.as_ptr(), column) == SQLITE_NULL }
+    }
+
+    pub fn column_text(&self, column: i32) -> Result<Option<String>, StorageError> {
+        let value_type = unsafe { sqlite3_column_type(self.raw.as_ptr(), column) };
+        if value_type == SQLITE_NULL {
+            return Ok(None);
+        }
+
+        let raw = unsafe { sqlite3_column_text(self.raw.as_ptr(), column) };
+        if raw.is_null() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned(),
+        ))
     }
 }
 
