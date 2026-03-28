@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-recorder-status"
+description = "Enables the recorder_status command without any pre-configured scope."
+commands.allow = ["recorder_status"]
+
+[[permission]]
+identifier = "allow-start-recording"
+description = "Enables the start_recording command without any pre-configured scope."
+commands.allow = ["start_recording"]
+
+[[permission]]
+identifier = "allow-stop-recording"
+description = "Enables the stop_recording command without any pre-configured scope."
+commands.allow = ["stop_recording"]

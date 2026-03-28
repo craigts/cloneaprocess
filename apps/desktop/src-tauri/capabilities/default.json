@@ -6,6 +6,11 @@
   "permissions": [
     "core:event:default",
     "core:window:default",
-    "core:app:default"
+    "core:app:default",
+    "allow-system-status",
+    "allow-recorder-status",
+    "allow-start-recording",
+    "allow-stop-recording",
+    "allow-storage-smoke-test"
   ]
 }
