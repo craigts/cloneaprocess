@@ -26,13 +26,7 @@ impl AppState {
             .map_err(|source| StorageError::io(recordings_root.clone(), source))?;
 
         let storage = Storage::bootstrap(app_data_dir.join("storage").join("cloneaprocess.sqlite3"))?;
-        let recorder_binary = app
-            .path()
-            .resolve(
-                "../../native/mac-recorder-service/.build/debug/RecorderService",
-                tauri::path::BaseDirectory::Resource,
-            )
-            .unwrap_or_else(|_| PathBuf::from("native/mac-recorder-service/.build/debug/RecorderService"));
+        let recorder_binary = resolve_recorder_binary(app);
 
         Ok(Self {
             started_at_ms: SystemTime::now()
@@ -60,4 +54,40 @@ impl AppState {
     pub fn recorder(&self) -> &Mutex<RecorderCoordinator> {
         &self.recorder
     }
+}
+
+fn resolve_recorder_binary(app: &AppHandle) -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| manifest_dir.clone());
+
+    let repo_relative = PathBuf::from("native")
+        .join("mac-recorder-service")
+        .join(".build")
+        .join("debug")
+        .join("RecorderService");
+
+    let mut candidates = vec![
+        workspace_root.join(&repo_relative),
+        manifest_dir.join("..").join("..").join("..").join(&repo_relative),
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&repo_relative),
+    ];
+
+    if let Ok(resource_path) = app.path().resolve(
+        "../../native/mac-recorder-service/.build/debug/RecorderService",
+        tauri::path::BaseDirectory::Resource,
+    ) {
+        candidates.push(resource_path);
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| workspace_root.join(repo_relative))
 }
