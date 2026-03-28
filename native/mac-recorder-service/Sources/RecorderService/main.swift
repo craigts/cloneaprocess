@@ -37,23 +37,34 @@ func runBridgeMode() {
     }
 
     let input = FileHandle.standardInput
-    while let lineData = try? input.read(upToCount: 4096), !lineData.isEmpty {
-        guard let line = String(data: lineData, encoding: .utf8) else { continue }
-        for rawLine in line.split(separator: "\n") {
-            guard let commandData = rawLine.data(using: .utf8),
-                  let command = try? JSONDecoder().decode(BridgeCommand.self, from: commandData)
-            else {
-                continue
-            }
-
-            if command.command == "stop" {
-                service.bridgeEndCapture { reply in
-                    writeBridgeMessage(kind: "capture_stopped", payload: reply)
+    DispatchQueue.global(qos: .userInitiated).async {
+        while let lineData = try? input.read(upToCount: 4096), !lineData.isEmpty {
+            guard let line = String(data: lineData, encoding: .utf8) else { continue }
+            for rawLine in line.split(separator: "\n") {
+                guard let commandData = rawLine.data(using: .utf8),
+                      let command = try? JSONDecoder().decode(BridgeCommand.self, from: commandData)
+                else {
+                    continue
                 }
-                return
+
+                if command.command == "stop" {
+                    service.bridgeEndCapture { reply in
+                        writeBridgeMessage(kind: "capture_stopped", payload: reply)
+                        DispatchQueue.main.async {
+                            CFRunLoopStop(CFRunLoopGetMain())
+                        }
+                    }
+                    return
+                }
             }
         }
+
+        DispatchQueue.main.async {
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
     }
+
+    RunLoop.main.run()
 }
 
 if CommandLine.arguments.contains("--permissions-json") {

@@ -220,9 +220,6 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             | (1 << CGEventType.leftMouseUp.rawValue)
             | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.rightMouseUp.rawValue)
-            | (1 << CGEventType.mouseMoved.rawValue)
-            | (1 << CGEventType.leftMouseDragged.rawValue)
-            | (1 << CGEventType.rightMouseDragged.rawValue)
 
         let observer = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
@@ -577,9 +574,6 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         case .leftMouseUp: return "mouse_up"
         case .rightMouseDown: return "mouse_down"
         case .rightMouseUp: return "mouse_up"
-        case .mouseMoved: return "mouse_move"
-        case .leftMouseDragged: return "mouse_drag"
-        case .rightMouseDragged: return "mouse_drag"
         default: return ""
         }
     }

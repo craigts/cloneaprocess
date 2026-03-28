@@ -3,7 +3,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -74,8 +76,8 @@ pub struct RecorderCoordinator {
 struct RecorderProcess {
     child: Child,
     stdin: ChildStdin,
-    events_rx: Receiver<BridgeMessage>,
-    state: ActiveCapture,
+    ingest_thread: JoinHandle<Result<(), RecorderError>>,
+    state: Arc<Mutex<ActiveCapture>>,
 }
 
 struct ActiveCapture {
@@ -108,19 +110,33 @@ impl RecorderCoordinator {
     }
 
     pub fn status(&mut self) -> Result<RecorderStatus, RecorderError> {
-        self.drain_events()?;
-        let permissions = self.permissions()?;
+        let permissions = match &self.process {
+            Some(process) => process
+                .state
+                .lock()
+                .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?
+                .permissions
+                .clone(),
+            None => self.permissions()?,
+        };
 
         Ok(match &self.process {
-            Some(process) => RecorderStatus {
+            Some(process) => {
+                let state = process
+                    .state
+                    .lock()
+                    .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
+
+                RecorderStatus {
                 active: true,
-                session_external_id: Some(process.state.session_external_id.clone()),
-                session_row_id: Some(process.state.session_row_id),
-                event_count: process.state.event_count,
-                frame_count: process.state.frame_count,
+                session_external_id: Some(state.session_external_id.clone()),
+                session_row_id: Some(state.session_row_id),
+                event_count: state.event_count,
+                frame_count: state.frame_count,
                 permissions,
                 recorder_binary: self.binary_path.display().to_string(),
-            },
+                }
+            }
             None => RecorderStatus {
                 active: false,
                 session_external_id: None,
@@ -179,41 +195,54 @@ impl RecorderCoordinator {
             status: "recording".to_string(),
         })?;
 
+        let state = Arc::new(Mutex::new(ActiveCapture {
+            session_row_id,
+            session_external_id,
+            next_sequence: 0,
+            event_count: 0,
+            frame_count: 0,
+            permissions,
+        }));
+        let ingest_thread = spawn_ingest_thread(self.storage.clone(), state.clone(), events_rx);
+
         self.process = Some(RecorderProcess {
             child,
             stdin,
-            events_rx,
-            state: ActiveCapture {
-                session_row_id,
-                session_external_id,
-                next_sequence: 0,
-                event_count: 0,
-                frame_count: 0,
-                permissions,
-            },
+            ingest_thread,
+            state,
         });
 
         self.status()
     }
 
     pub fn stop_capture(&mut self) -> Result<RecorderStatus, RecorderError> {
-        self.drain_events()?;
-
         let Some(mut process) = self.process.take() else {
             return self.status();
         };
 
         send_command(&mut process.stdin, "stop")?;
-        let _ = wait_for_message(&process.events_rx, "capture_stopped")?;
         let _ = process.child.wait();
+        match process.ingest_thread.join() {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(RecorderError::Protocol(
+                    "recorder ingest thread panicked".to_string(),
+                ))
+            }
+        }
+
+        let state = process
+            .state
+            .lock()
+            .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
 
         Ok(RecorderStatus {
             active: false,
-            session_external_id: Some(process.state.session_external_id),
-            session_row_id: Some(process.state.session_row_id),
-            event_count: process.state.event_count,
-            frame_count: process.state.frame_count,
-            permissions: process.state.permissions,
+            session_external_id: Some(state.session_external_id.clone()),
+            session_row_id: Some(state.session_row_id),
+            event_count: state.event_count,
+            frame_count: state.frame_count,
+            permissions: state.permissions.clone(),
             recorder_binary: self.binary_path.display().to_string(),
         })
     }
@@ -230,45 +259,6 @@ impl RecorderCoordinator {
 
         let permissions = serde_json::from_slice::<BTreeMap<String, bool>>(&output.stdout)?;
         Ok(permissions)
-    }
-
-    fn drain_events(&mut self) -> Result<(), RecorderError> {
-        let Some(process) = &mut self.process else {
-            return Ok(());
-        };
-
-        while let Ok(message) = process.events_rx.try_recv() {
-            if message.kind != "event" {
-                continue;
-            }
-
-            let event_type = message
-                .payload
-                .get("type")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| RecorderError::Protocol("event envelope missing type".to_string()))?
-                .to_string();
-
-            self.storage.insert_raw_event(&NewRawEvent {
-                session_id: process.state.session_row_id,
-                sequence: process.state.next_sequence,
-                event_type: event_type.clone(),
-                event_json: serde_json::to_string(&message.payload)?,
-                recorded_at_ms: message
-                    .payload
-                    .get("ts")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or_else(now_ms) as u64,
-            })?;
-
-            process.state.next_sequence += 1;
-            process.state.event_count += 1;
-            if event_type == "screen_frame" {
-                process.state.frame_count += 1;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -296,6 +286,51 @@ fn spawn_bridge_reader(stdout: std::process::ChildStdout) -> Receiver<BridgeMess
         }
     });
     rx
+}
+
+fn spawn_ingest_thread(
+    storage: Storage,
+    state: Arc<Mutex<ActiveCapture>>,
+    rx: Receiver<BridgeMessage>,
+) -> JoinHandle<Result<(), RecorderError>> {
+    thread::spawn(move || {
+        while let Ok(message) = rx.recv() {
+            if message.kind != "event" {
+                continue;
+            }
+
+            let event_type = message
+                .payload
+                .get("type")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| RecorderError::Protocol("event envelope missing type".to_string()))?
+                .to_string();
+
+            let mut state_guard = state
+                .lock()
+                .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
+
+            storage.insert_raw_event(&NewRawEvent {
+                session_id: state_guard.session_row_id,
+                sequence: state_guard.next_sequence,
+                event_type: event_type.clone(),
+                event_json: serde_json::to_string(&message.payload)?,
+                recorded_at_ms: message
+                    .payload
+                    .get("ts")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_else(now_ms),
+            })?;
+
+            state_guard.next_sequence += 1;
+            state_guard.event_count += 1;
+            if event_type == "screen_frame" {
+                state_guard.frame_count += 1;
+            }
+        }
+
+        Ok(())
+    })
 }
 
 fn wait_for_message(rx: &Receiver<BridgeMessage>, expected_kind: &str) -> Result<BridgeMessage, RecorderError> {
