@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,7 @@ pub struct RecorderCoordinator {
 }
 
 const BRIDGE_START_TIMEOUT: Duration = Duration::from_secs(3);
+const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct RecorderProcess {
     child: Child,
@@ -223,7 +224,21 @@ impl RecorderCoordinator {
         };
 
         send_command(&mut process.stdin, "stop")?;
-        let _ = process.child.wait();
+        drop(process.stdin);
+
+        let stop_deadline = Instant::now() + BRIDGE_STOP_TIMEOUT;
+        loop {
+            match process.child.try_wait()? {
+                Some(_) => break,
+                None if Instant::now() < stop_deadline => thread::sleep(Duration::from_millis(25)),
+                None => {
+                    let _ = process.child.kill();
+                    let _ = process.child.wait();
+                    break;
+                }
+            }
+        }
+
         match process.ingest_thread.join() {
             Ok(result) => result?,
             Err(_) => {
