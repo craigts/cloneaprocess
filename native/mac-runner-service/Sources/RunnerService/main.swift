@@ -1,4 +1,8 @@
 import Foundation
 
 let service = RunnerService()
-service.run()
+if CommandLine.arguments.contains("--bridge") {
+    service.runBridge()
+} else {
+    service.run()
+}

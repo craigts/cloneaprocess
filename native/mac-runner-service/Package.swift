@@ -17,6 +17,10 @@ let package = Package(
             name: "RunnerService",
             path: "Sources/RunnerService"
         ),
+        .testTarget(
+            name: "RunnerServiceTests",
+            dependencies: ["RunnerService"],
+            path: "Tests/RunnerServiceTests"
+        ),
     ]
 )
-
