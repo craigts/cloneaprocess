@@ -35,7 +35,7 @@ import ScreenCaptureKit
 final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private let enableEventTap = true
     private let enableAXSnapshots = false
-    private let enableKeyframes = false
+    private let enableKeyframes = true
     private var captureSessionId: String?
     private var captureStartedAtMs: UInt64?
     private var emittedEventCount: UInt64 = 0
