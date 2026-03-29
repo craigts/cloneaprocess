@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,6 @@ pub enum RecorderError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Storage(StorageError),
-    ProcessExited,
     Protocol(String),
 }
 
@@ -29,7 +28,6 @@ impl std::fmt::Display for RecorderError {
             Self::Io(error) => write!(f, "io error: {}", error),
             Self::Json(error) => write!(f, "json error: {}", error),
             Self::Storage(error) => write!(f, "storage error: {}", error),
-            Self::ProcessExited => write!(f, "recorder process exited"),
             Self::Protocol(message) => write!(f, "protocol error: {}", message),
         }
     }
@@ -72,6 +70,8 @@ pub struct RecorderCoordinator {
     binary_path: PathBuf,
     process: Option<RecorderProcess>,
 }
+
+const BRIDGE_START_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct RecorderProcess {
     child: Child,
@@ -128,13 +128,13 @@ impl RecorderCoordinator {
                     .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
 
                 RecorderStatus {
-                active: true,
-                session_external_id: Some(state.session_external_id.clone()),
-                session_row_id: Some(state.session_row_id),
-                event_count: state.event_count,
-                frame_count: state.frame_count,
-                permissions,
-                recorder_binary: self.binary_path.display().to_string(),
+                    active: true,
+                    session_external_id: Some(state.session_external_id.clone()),
+                    session_row_id: Some(state.session_row_id),
+                    event_count: state.event_count,
+                    frame_count: state.frame_count,
+                    permissions,
+                    recorder_binary: self.binary_path.display().to_string(),
                 }
             }
             None => RecorderStatus {
@@ -169,12 +169,14 @@ impl RecorderCoordinator {
         let stdout = child.stdout.take().ok_or_else(|| RecorderError::Protocol("missing stdout".to_string()))?;
         let events_rx = spawn_bridge_reader(stdout);
 
-        let permissions_message = wait_for_message(&events_rx, "permissions")?;
+        let permissions_message = wait_for_message(&events_rx, "permissions", BRIDGE_START_TIMEOUT)?;
         let permissions: BTreeMap<String, bool> = serde_json::from_value(permissions_message.payload)?;
 
-        let session_message = wait_for_message(&events_rx, "capture_started")?;
+        let session_message = wait_for_message(&events_rx, "capture_started", BRIDGE_START_TIMEOUT)?;
         let session_payload: CaptureStartedPayload = serde_json::from_value(session_message.payload)?;
         if !session_payload.ok {
+            drop(stdin);
+            let _ = child.kill();
             let _ = child.wait();
             return Err(RecorderError::Protocol(
                 session_payload
@@ -349,9 +351,15 @@ fn extract_keyframe(payload: &serde_json::Value, session_id: i64) -> Option<NewK
     })
 }
 
-fn wait_for_message(rx: &Receiver<BridgeMessage>, expected_kind: &str) -> Result<BridgeMessage, RecorderError> {
+fn wait_for_message(
+    rx: &Receiver<BridgeMessage>,
+    expected_kind: &str,
+    timeout: Duration,
+) -> Result<BridgeMessage, RecorderError> {
     loop {
-        let message = rx.recv().map_err(|_| RecorderError::ProcessExited)?;
+        let message = rx
+            .recv_timeout(timeout)
+            .map_err(|_| RecorderError::Protocol(format!("timed out waiting for {}", expected_kind)))?;
         if message.kind == expected_kind {
             return Ok(message);
         }

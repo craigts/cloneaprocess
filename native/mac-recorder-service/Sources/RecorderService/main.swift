@@ -34,6 +34,11 @@ func runBridgeMode() {
 
     service.bridgeBeginCapture(config: [:]) { reply in
         writeBridgeMessage(kind: "capture_started", payload: reply)
+        if let ok = reply["ok"] as? Bool, !ok {
+            DispatchQueue.main.async {
+                CFRunLoopStop(CFRunLoopGetMain())
+            }
+        }
     }
 
     let input = FileHandle.standardInput
