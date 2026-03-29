@@ -42,6 +42,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private var emittedFrameCount: UInt64 = 0
     private var eventTapPort: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
+    private var workspaceObserver: NSObjectProtocol?
     private var subscriberConnectionByIdentifier: [ObjectIdentifier: NSXPCConnection] = [:]
     private var frameOutputDirectoryURL: URL?
     private let eventDeliveryQueue = DispatchQueue(label: "com.cloneaprocess.recorder.event-delivery")
@@ -131,7 +132,18 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         emittedFrameCount = 0
         frameOutputDirectoryURL = frameDirectoryURL
 
+        startWorkspaceObserver()
+        emitFrontmostApplicationChanged()
+
         let tapStarted = enableEventTap ? startEventTap() : true
+        if !tapStarted {
+            stopWorkspaceObserver()
+            captureSessionId = nil
+            captureStartedAtMs = nil
+            emittedEventCount = 0
+            emittedFrameCount = 0
+            frameOutputDirectoryURL = nil
+        }
         reply([
             "ok": tapStarted,
             "session_id": sessionId,
@@ -150,6 +162,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         }
 
         stopEventTap()
+        stopWorkspaceObserver()
         let endedAt = nowMs()
 
         reply([
@@ -271,6 +284,61 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
 
         eventTapRunLoopSource = nil
         eventTapPort = nil
+        #endif
+    }
+
+    private func startWorkspaceObserver() {
+        #if canImport(AppKit)
+        guard workspaceObserver == nil else { return }
+
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.emitFrontmostApplicationChanged()
+        }
+        #endif
+    }
+
+    private func stopWorkspaceObserver() {
+        #if canImport(AppKit)
+        if let workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            self.workspaceObserver = nil
+        }
+        #endif
+    }
+
+    private func emitFrontmostApplicationChanged() {
+        #if canImport(AppKit)
+        guard let sessionId = captureSessionId else { return }
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+
+        emittedEventCount += 1
+
+        var payload: [String: Any] = [
+            "session_id": sessionId,
+            "pid": app.processIdentifier,
+        ]
+        if let bundleIdentifier = app.bundleIdentifier {
+            payload["bundle_id"] = bundleIdentifier
+        }
+        if let localizedName = app.localizedName {
+            payload["name"] = localizedName
+        }
+
+        let envelope: [String: Any] = [
+            "v": 1,
+            "id": "evt_\(UUID().uuidString.lowercased())",
+            "ts": nowMs(),
+            "type": "frontmost_app_changed",
+            "payload": payload,
+        ]
+
+        eventDeliveryQueue.async { [weak self] in
+            self?.emitEvent(envelope)
+        }
         #endif
     }
 
