@@ -238,6 +238,22 @@ impl Storage {
         Ok(statement.query_int64()?.unwrap_or(0))
     }
 
+    pub fn complete_session(&self, session_id: i64, ended_at_ms: u64) -> Result<(), StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            UPDATE sessions
+            SET ended_at_ms = ?, status = ?
+            WHERE id = ?
+            "#,
+        )?;
+        statement.bind_int64(1, ended_at_ms as i64)?;
+        statement.bind_text(2, "completed")?;
+        statement.bind_int64(3, session_id)?;
+        statement.execute()?;
+        Ok(())
+    }
+
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionRecord>, StorageError> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
@@ -388,6 +404,13 @@ mod tests {
             .expect("keyframe insert should succeed");
         assert!(keyframe_id > 0, "keyframe row id should be positive");
         assert_eq!(storage.keyframe_count().expect("keyframe count should load"), 1);
+
+        storage
+            .complete_session(session_id, 3)
+            .expect("session should complete");
+        let sessions = storage.list_sessions(10).expect("sessions should still load");
+        assert_eq!(sessions[0].status, "completed");
+        assert_eq!(sessions[0].ended_at_ms, Some(3));
 
         let _ = fs::remove_dir_all(&root);
     }

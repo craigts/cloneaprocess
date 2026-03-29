@@ -253,6 +253,10 @@ impl RecorderCoordinator {
             .lock()
             .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
 
+        self.storage
+            .complete_session(state.session_row_id, now_ms())
+            .map_err(RecorderError::Storage)?;
+
         Ok(RecorderStatus {
             active: false,
             session_external_id: Some(state.session_external_id.clone()),
