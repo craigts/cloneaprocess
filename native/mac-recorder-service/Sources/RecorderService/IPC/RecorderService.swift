@@ -33,6 +33,9 @@ import ScreenCaptureKit
 }
 
 final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
+    private let enableEventTap = true
+    private let enableAXSnapshots = false
+    private let enableKeyframes = false
     private var captureSessionId: String?
     private var captureStartedAtMs: UInt64?
     private var emittedEventCount: UInt64 = 0
@@ -41,7 +44,9 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private var eventTapRunLoopSource: CFRunLoopSource?
     private var subscriberConnectionByIdentifier: [ObjectIdentifier: NSXPCConnection] = [:]
     private var frameOutputDirectoryURL: URL?
+    private let eventDeliveryQueue = DispatchQueue(label: "com.cloneaprocess.recorder.event-delivery")
     private let frameCaptureQueue = DispatchQueue(label: "com.cloneaprocess.recorder.frame-capture")
+    private let accessibilityQueue = DispatchQueue(label: "com.cloneaprocess.recorder.accessibility")
 
     func ping(_ reply: @escaping (String) -> Void) {
         reply("pong")
@@ -126,7 +131,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
         emittedFrameCount = 0
         frameOutputDirectoryURL = frameDirectoryURL
 
-        let tapStarted = startEventTap()
+        let tapStarted = enableEventTap ? startEventTap() : true
         reply([
             "ok": tapStarted,
             "session_id": sessionId,
@@ -294,10 +299,14 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             "payload": payload,
         ]
 
-        emitEvent(envelope)
+        eventDeliveryQueue.async { [weak self] in
+            self?.emitEvent(envelope)
+        }
 
         if shouldCaptureAXSnapshot(for: type) {
-            emitAXSnapshot(at: location)
+            accessibilityQueue.async { [weak self] in
+                self?.emitAXSnapshot(at: location)
+            }
         }
 
         if shouldCaptureKeyframe(for: type) {
@@ -306,6 +315,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     }
 
     private func shouldCaptureAXSnapshot(for eventType: CGEventType) -> Bool {
+        guard enableAXSnapshots else { return false }
         switch eventType {
         case .leftMouseDown, .rightMouseDown:
             return true
@@ -315,6 +325,7 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     }
 
     private func shouldCaptureKeyframe(for eventType: CGEventType) -> Bool {
+        guard enableKeyframes else { return false }
         switch eventType {
         case .leftMouseDown, .rightMouseDown, .keyDown:
             return true
@@ -668,10 +679,13 @@ enum RecorderBridgeEmitter {
 }
 
 final class RecorderBridgeEmitterState: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.cloneaprocess.recorder.bridge-emitter")
     var handler: (([String: Any]) -> Void)?
 
     func emit(_ event: [String: Any]) {
-        handler?(event)
+        queue.async { [handler] in
+            handler?(event)
+        }
     }
 }
 #else
