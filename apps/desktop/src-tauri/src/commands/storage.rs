@@ -25,6 +25,10 @@ pub struct SessionSummary {
     started_at_ms: u64,
     ended_at_ms: Option<u64>,
     status: String,
+    app_transition_count: i64,
+    ax_snapshot_count: i64,
+    keyframe_count: i64,
+    last_error: Option<String>,
     created_at_ms: u64,
 }
 
@@ -115,6 +119,10 @@ fn map_session(row: SessionRecord) -> SessionSummary {
         started_at_ms: row.started_at_ms,
         ended_at_ms: row.ended_at_ms,
         status: row.status,
+        app_transition_count: row.app_transition_count,
+        ax_snapshot_count: row.ax_snapshot_count,
+        keyframe_count: row.keyframe_count_cached,
+        last_error: row.last_error,
         created_at_ms: row.created_at_ms,
     }
 }

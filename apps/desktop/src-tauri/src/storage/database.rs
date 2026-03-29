@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at_ms INTEGER NOT NULL,
     ended_at_ms INTEGER,
     status TEXT NOT NULL,
+    app_transition_count INTEGER NOT NULL DEFAULT 0,
+    ax_snapshot_count INTEGER NOT NULL DEFAULT 0,
+    keyframe_count_cached INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
     created_at_ms INTEGER NOT NULL
 );
 
@@ -79,6 +83,10 @@ pub struct SessionRecord {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub status: String,
+    pub app_transition_count: i64,
+    pub ax_snapshot_count: i64,
+    pub keyframe_count_cached: i64,
+    pub last_error: Option<String>,
     pub created_at_ms: u64,
 }
 
@@ -146,8 +154,12 @@ impl Storage {
                 started_at_ms,
                 ended_at_ms,
                 status,
+                app_transition_count,
+                ax_snapshot_count,
+                keyframe_count_cached,
+                last_error,
                 created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )?;
 
@@ -160,7 +172,11 @@ impl Storage {
         statement.bind_int64(3, session.started_at_ms as i64)?;
         statement.bind_null(4)?;
         statement.bind_text(5, &session.status)?;
-        statement.bind_int64(6, now_ms() as i64)?;
+        statement.bind_int64(6, 0)?;
+        statement.bind_int64(7, 0)?;
+        statement.bind_int64(8, 0)?;
+        statement.bind_null(9)?;
+        statement.bind_int64(10, now_ms() as i64)?;
         statement.execute()?;
 
         Ok(connection.last_insert_rowid())
@@ -254,11 +270,51 @@ impl Storage {
         Ok(())
     }
 
+    pub fn update_session_summary(
+        &self,
+        session_id: i64,
+        app_transition_count: i64,
+        ax_snapshot_count: i64,
+        keyframe_count_cached: i64,
+        last_error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            UPDATE sessions
+            SET app_transition_count = ?, ax_snapshot_count = ?, keyframe_count_cached = ?, last_error = ?
+            WHERE id = ?
+            "#,
+        )?;
+        statement.bind_int64(1, app_transition_count)?;
+        statement.bind_int64(2, ax_snapshot_count)?;
+        statement.bind_int64(3, keyframe_count_cached)?;
+        if let Some(last_error) = last_error {
+            statement.bind_text(4, last_error)?;
+        } else {
+            statement.bind_null(4)?;
+        }
+        statement.bind_int64(5, session_id)?;
+        statement.execute()?;
+        Ok(())
+    }
+
     pub fn list_sessions(&self, limit: i64) -> Result<Vec<SessionRecord>, StorageError> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             r#"
-            SELECT id, external_id, label, started_at_ms, ended_at_ms, status, created_at_ms
+            SELECT
+                id,
+                external_id,
+                label,
+                started_at_ms,
+                ended_at_ms,
+                status,
+                app_transition_count,
+                ax_snapshot_count,
+                keyframe_count_cached,
+                last_error,
+                created_at_ms
             FROM sessions
             ORDER BY started_at_ms DESC, id DESC
             LIMIT ?
@@ -279,7 +335,11 @@ impl Storage {
                     Some(statement.column_int64(4) as u64)
                 },
                 status: statement.column_text(5)?.unwrap_or_default(),
-                created_at_ms: statement.column_int64(6) as u64,
+                app_transition_count: statement.column_int64(6),
+                ax_snapshot_count: statement.column_int64(7),
+                keyframe_count_cached: statement.column_int64(8),
+                last_error: statement.column_text(9)?,
+                created_at_ms: statement.column_int64(10) as u64,
             });
         }
 
@@ -323,6 +383,33 @@ impl Storage {
     fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.open_connection()?;
         connection.exec_batch(BOOTSTRAP_SQL)?;
+        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN app_transition_count INTEGER NOT NULL DEFAULT 0")?;
+        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN ax_snapshot_count INTEGER NOT NULL DEFAULT 0")?;
+        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN keyframe_count_cached INTEGER NOT NULL DEFAULT 0")?;
+        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN last_error TEXT")?;
+        connection.exec_batch(
+            r#"
+            UPDATE sessions
+            SET
+                app_transition_count = (
+                    SELECT COUNT(*)
+                    FROM raw_events
+                    WHERE raw_events.session_id = sessions.id
+                      AND raw_events.event_type = 'frontmost_app_changed'
+                ),
+                ax_snapshot_count = (
+                    SELECT COUNT(*)
+                    FROM raw_events
+                    WHERE raw_events.session_id = sessions.id
+                      AND raw_events.event_type = 'ax_snapshot'
+                ),
+                keyframe_count_cached = (
+                    SELECT COUNT(*)
+                    FROM keyframes
+                    WHERE keyframes.session_id = sessions.id
+                )
+            "#,
+        )?;
 
         let mut statement = connection.prepare(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (?, ?)",
@@ -344,6 +431,14 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn apply_optional_migration(connection: &Connection, sql: &str) -> Result<(), StorageError> {
+    match connection.exec_batch(sql) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +482,10 @@ mod tests {
         let sessions = storage.list_sessions(10).expect("sessions should load");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].external_id, "sess_smoke");
+        assert_eq!(sessions[0].app_transition_count, 0);
+        assert_eq!(sessions[0].ax_snapshot_count, 0);
+        assert_eq!(sessions[0].keyframe_count_cached, 0);
+        assert_eq!(sessions[0].last_error, None);
 
         let events = storage
             .list_raw_events_for_session(session_id, 10)
@@ -404,6 +503,9 @@ mod tests {
             .expect("keyframe insert should succeed");
         assert!(keyframe_id > 0, "keyframe row id should be positive");
         assert_eq!(storage.keyframe_count().expect("keyframe count should load"), 1);
+        storage
+            .update_session_summary(session_id, 3, 2, 1, Some("helper exited"))
+            .expect("session summary should update");
 
         storage
             .complete_session(session_id, 3)
@@ -411,6 +513,10 @@ mod tests {
         let sessions = storage.list_sessions(10).expect("sessions should still load");
         assert_eq!(sessions[0].status, "completed");
         assert_eq!(sessions[0].ended_at_ms, Some(3));
+        assert_eq!(sessions[0].app_transition_count, 3);
+        assert_eq!(sessions[0].ax_snapshot_count, 2);
+        assert_eq!(sessions[0].keyframe_count_cached, 1);
+        assert_eq!(sessions[0].last_error.as_deref(), Some("helper exited"));
 
         let _ = fs::remove_dir_all(&root);
     }

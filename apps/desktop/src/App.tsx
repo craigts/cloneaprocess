@@ -14,6 +14,10 @@ type BackendStatus = {
   workflowIrVersion: number
   recorderBinary: string
   recorderPermissions: Record<string, boolean>
+  storageReady: boolean
+  recordingsRootReady: boolean
+  recorderBinaryExists: boolean
+  helperHealth: 'ready' | 'missing_binary'
 }
 
 type RecorderStatus = {
@@ -33,6 +37,10 @@ type SessionSummary = {
   startedAtMs: number
   endedAtMs: number | null
   status: string
+  appTransitionCount: number
+  axSnapshotCount: number
+  keyframeCount: number
+  lastError: string | null
   createdAtMs: number
 }
 
@@ -68,6 +76,10 @@ const browserFallbackStatus: BackendStatus = {
   workflowIrVersion: 1,
   recorderBinary: './native/mac-recorder-service/.build/debug/RecorderService',
   recorderPermissions: {},
+  storageReady: true,
+  recordingsRootReady: true,
+  recorderBinaryExists: true,
+  helperHealth: 'ready',
 }
 
 export function App() {
@@ -157,6 +169,47 @@ export function App() {
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
     [selectedSessionId, sessions],
   )
+  const prerequisites = useMemo(() => {
+    if (!status) {
+      return []
+    }
+
+    return [
+      {
+        id: 'storage',
+        label: 'Storage ready',
+        ready: status.storageReady && status.recordingsRootReady,
+        detail: status.storageReady
+          ? `Database at ${status.databasePath}`
+          : 'App data directory is not writable yet.',
+        remediation: 'Restart after granting app data access or resolving the app data path.',
+      },
+      {
+        id: 'helper',
+        label: 'Recorder helper',
+        ready: status.recorderBinaryExists && status.helperHealth === 'ready',
+        detail: status.recorderBinaryExists
+          ? status.recorderBinary
+          : `Missing helper binary at ${status.recorderBinary}`,
+        remediation: 'Run `npm run desktop:run` to rebuild the Swift recorder helper.',
+      },
+      {
+        id: 'accessibility',
+        label: 'Accessibility',
+        ready: Boolean(recorder?.permissions.accessibility ?? status.recorderPermissions.accessibility),
+        detail: 'Required for event taps and AX snapshots.',
+        remediation: 'Enable the app in System Settings > Privacy & Security > Accessibility.',
+      },
+      {
+        id: 'screen-recording',
+        label: 'Screen Recording',
+        ready: Boolean(recorder?.permissions.screenRecording ?? status.recorderPermissions.screenRecording),
+        detail: 'Required for keyframe capture.',
+        remediation: 'Enable the app in System Settings > Privacy & Security > Screen Recording.',
+      },
+    ]
+  }, [recorder, status])
+  const canStartRecording = prerequisites.length > 0 && prerequisites.every((item) => item.ready)
 
   return (
     <main className="shell">
@@ -230,7 +283,11 @@ export function App() {
         </header>
 
         <div className="actions">
-          <button type="button" onClick={() => void handleRecorderAction('start_recording')}>
+          <button
+            type="button"
+            disabled={!canStartRecording}
+            onClick={() => void handleRecorderAction('start_recording')}
+          >
             Start recording
           </button>
           <button type="button" onClick={() => void handleRecorderAction('stop_recording')}>
@@ -242,32 +299,49 @@ export function App() {
         </div>
 
         {recorder ? (
-          <dl className="status-grid">
-            <div>
-              <dt>Recorder binary</dt>
-              <dd>{recorder.recorderBinary}</dd>
+          <>
+            <dl className="status-grid">
+              <div>
+                <dt>Recorder binary</dt>
+                <dd>{recorder.recorderBinary}</dd>
+              </div>
+              <div>
+                <dt>Session</dt>
+                <dd>{recorder.sessionExternalId ?? 'none'}</dd>
+              </div>
+              <div>
+                <dt>Events ingested</dt>
+                <dd>{recorder.eventCount}</dd>
+              </div>
+              <div>
+                <dt>Frames ingested</dt>
+                <dd>{recorder.frameCount}</dd>
+              </div>
+              <div>
+                <dt>Accessibility</dt>
+                <dd>{String(recorder.permissions.accessibility ?? false)}</dd>
+              </div>
+              <div>
+                <dt>Screen recording</dt>
+                <dd>{String(recorder.permissions.screenRecording ?? false)}</dd>
+              </div>
+            </dl>
+
+            <div className="prereq-grid">
+              {prerequisites.map((item) => (
+                <article key={item.id} className={`prereq-card ${item.ready ? '' : 'prereq-card--blocked'}`}>
+                  <div className="prereq-card__header">
+                    <strong>{item.label}</strong>
+                    <span className={`status-pill ${item.ready ? '' : 'status-pill--warning'}`}>
+                      {item.ready ? 'ready' : 'action needed'}
+                    </span>
+                  </div>
+                  <p>{item.detail}</p>
+                  {!item.ready ? <p className="note prereq-card__note">{item.remediation}</p> : null}
+                </article>
+              ))}
             </div>
-            <div>
-              <dt>Session</dt>
-              <dd>{recorder.sessionExternalId ?? 'none'}</dd>
-            </div>
-            <div>
-              <dt>Events ingested</dt>
-              <dd>{recorder.eventCount}</dd>
-            </div>
-            <div>
-              <dt>Frames ingested</dt>
-              <dd>{recorder.frameCount}</dd>
-            </div>
-            <div>
-              <dt>Accessibility</dt>
-              <dd>{String(recorder.permissions.accessibility ?? false)}</dd>
-            </div>
-            <div>
-              <dt>Screen recording</dt>
-              <dd>{String(recorder.permissions.screenRecording ?? false)}</dd>
-            </div>
-          </dl>
+          </>
         ) : (
           <p className="loading">Recorder bridge status unavailable.</p>
         )}
@@ -300,6 +374,10 @@ export function App() {
                   <span className="session-card__meta">#{session.id}</span>
                   <span className="session-card__meta">{formatTimestamp(session.startedAtMs)}</span>
                   <span className="session-card__meta">{session.status}</span>
+                  <span className="session-card__meta">
+                    {session.appTransitionCount} app hops, {session.axSnapshotCount} AX, {session.keyframeCount} frames
+                  </span>
+                  {session.lastError ? <span className="session-card__meta">Last error: {session.lastError}</span> : null}
                 </button>
               ))
             )}
@@ -311,6 +389,9 @@ export function App() {
                 <strong>{selectedSession.label ?? selectedSession.externalId}</strong>
                 <span>{formatTimestamp(selectedSession.startedAtMs)}</span>
                 <span>{events.length} events loaded</span>
+                <span>{selectedSession.appTransitionCount} app switches</span>
+                <span>{selectedSession.axSnapshotCount} AX snapshots</span>
+                <span>{selectedSession.keyframeCount} keyframes</span>
               </div>
             ) : (
               <p className="loading">Select a session to inspect events.</p>

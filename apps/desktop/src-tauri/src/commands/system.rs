@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::path::Path;
 use tauri::State;
 
 use crate::core::app_state::AppState;
@@ -20,6 +21,10 @@ pub struct SystemStatus {
     workflow_ir_version: u32,
     recorder_binary: String,
     recorder_permissions: std::collections::BTreeMap<String, bool>,
+    storage_ready: bool,
+    recordings_root_ready: bool,
+    recorder_binary_exists: bool,
+    helper_health: &'static str,
 }
 
 #[tauri::command]
@@ -43,6 +48,10 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         .map_err(|_| "recorder mutex poisoned".to_string())?
         .status()
         .map_err(|error| error.to_string())?;
+    let recorder_binary_exists = Path::new(&recorder_status.recorder_binary).exists();
+    let storage_ready = storage_status.db_path.parent().map(Path::exists).unwrap_or(false);
+    let recordings_root_ready = state.recordings_root().exists();
+    let helper_health = if recorder_binary_exists { "ready" } else { "missing_binary" };
 
     Ok(SystemStatus {
         app_version: env!("CARGO_PKG_VERSION"),
@@ -57,5 +66,9 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         workflow_ir_version: WORKFLOW_IR_VERSION,
         recorder_binary: recorder_status.recorder_binary,
         recorder_permissions: recorder_status.permissions,
+        storage_ready,
+        recordings_root_ready,
+        recorder_binary_exists,
+        helper_health,
     })
 }

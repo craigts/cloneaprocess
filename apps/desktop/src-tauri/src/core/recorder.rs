@@ -90,6 +90,9 @@ struct ActiveCapture {
     next_sequence: i64,
     event_count: i64,
     frame_count: i64,
+    app_transition_count: i64,
+    ax_snapshot_count: i64,
+    last_error: Option<String>,
     permissions: BTreeMap<String, bool>,
 }
 
@@ -289,6 +292,9 @@ impl RecorderCoordinator {
             next_sequence: 0,
             event_count: 0,
             frame_count: 0,
+            app_transition_count: 0,
+            ax_snapshot_count: 0,
+            last_error: None,
             permissions,
         }));
         let ingest_thread = spawn_ingest_thread(self.storage.clone(), state.clone(), events_rx);
@@ -468,12 +474,33 @@ fn spawn_ingest_thread(
 
             state_guard.next_sequence += 1;
             state_guard.event_count += 1;
+            if event_type == "frontmost_app_changed" {
+                state_guard.app_transition_count += 1;
+            }
+            if event_type == "ax_snapshot" {
+                state_guard.ax_snapshot_count += 1;
+            }
             if event_type == "screen_frame" {
                 if let Some(keyframe) = extract_keyframe(&message.payload, state_guard.session_row_id) {
                     let _ = storage.insert_keyframe(&keyframe);
                 }
                 state_guard.frame_count += 1;
             }
+            if event_type == "bridge_error" {
+                state_guard.last_error = message
+                    .payload
+                    .get("payload")
+                    .and_then(|value| value.get("message"))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned);
+            }
+            storage.update_session_summary(
+                state_guard.session_row_id,
+                state_guard.app_transition_count,
+                state_guard.ax_snapshot_count,
+                state_guard.frame_count,
+                state_guard.last_error.as_deref(),
+            )?;
         }
 
         Ok(())

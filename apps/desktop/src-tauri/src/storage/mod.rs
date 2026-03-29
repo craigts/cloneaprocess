@@ -7,4 +7,4 @@ pub use database::{
 };
 pub use error::StorageError;
 
-pub const STORAGE_SCHEMA_VERSION: u32 = 1;
+pub const STORAGE_SCHEMA_VERSION: u32 = 2;

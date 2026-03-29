@@ -171,6 +171,47 @@ select {
   box-shadow: 0 12px 32px rgba(33, 44, 48, 0.08);
 }
 
+.actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+  transform: none;
+  box-shadow: none;
+}
+
+.prereq-grid {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.85rem;
+}
+
+.prereq-card {
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(23, 52, 67, 0.07);
+  border: 1px solid rgba(23, 52, 67, 0.1);
+}
+
+.prereq-card--blocked {
+  background: rgba(154, 90, 27, 0.08);
+  border-color: rgba(154, 90, 27, 0.18);
+}
+
+.prereq-card__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.prereq-card p {
+  margin: 0.75rem 0 0;
+}
+
+.prereq-card__note {
+  margin-top: 0.65rem;
+}
+
 .timeline-layout {
   margin-top: 1rem;
   display: grid;
