@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 
 type BackendStatus = {
   appVersion: string
@@ -350,10 +350,45 @@ function TimelineEventCard({ event }: { event: TimelineEvent }) {
   const parsed = parseEventJson(event.eventJson)
   const payload = parsed.payload ?? {}
   const framePath = typeof payload.path === 'string' ? payload.path : null
-  const imageSrc =
-    framePath && isTauri()
-      ? convertFileSrc(framePath)
-      : framePath
+  const [imageSrc, setImageSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    let revokedUrl: string | null = null
+    let cancelled = false
+
+    if (!framePath) {
+      setImageSrc(null)
+      return
+    }
+
+    if (!isTauri()) {
+      setImageSrc(framePath)
+      return
+    }
+
+    invoke<number[]>('load_keyframe_bytes', { path: framePath })
+      .then((bytes) => {
+        if (cancelled) {
+          return
+        }
+
+        const blob = new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' })
+        revokedUrl = URL.createObjectURL(blob)
+        setImageSrc(revokedUrl)
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setImageSrc(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+      if (revokedUrl) {
+        URL.revokeObjectURL(revokedUrl)
+      }
+    }
+  }, [framePath])
 
   return (
     <article className="timeline-event">

@@ -12,3 +12,8 @@ commands.allow = ["list_sessions"]
 identifier = "allow-list-session-events"
 description = "Enables the list_session_events command without any pre-configured scope."
 commands.allow = ["list_session_events"]
+
+[[permission]]
+identifier = "allow-load-keyframe-bytes"
+description = "Enables the load_keyframe_bytes command without any pre-configured scope."
+commands.allow = ["load_keyframe_bytes"]

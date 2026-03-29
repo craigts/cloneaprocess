@@ -17,6 +17,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::recorder::recorder_status,
+            commands::storage::load_keyframe_bytes,
             commands::storage::list_session_events,
             commands::storage::list_sessions,
             commands::storage::storage_smoke_test,

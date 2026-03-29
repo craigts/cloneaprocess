@@ -1,3 +1,4 @@
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -99,6 +100,11 @@ pub fn list_session_events(
         .map_err(|error| error.to_string())?;
 
     Ok(rows.into_iter().map(map_event).collect())
+}
+
+#[tauri::command]
+pub fn load_keyframe_bytes(path: String) -> Result<Vec<u8>, String> {
+    fs::read(&path).map_err(|error| format!("failed to read keyframe {}: {}", path, error))
 }
 
 fn map_session(row: SessionRecord) -> SessionSummary {

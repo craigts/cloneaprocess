@@ -14,6 +14,7 @@
     "allow-storage-smoke-test",
     "allow-list-sessions",
     "allow-list-session-events",
+    "allow-load-keyframe-bytes",
     "allow-compile-workflow-preview"
   ]
 }
