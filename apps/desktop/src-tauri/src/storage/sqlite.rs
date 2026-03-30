@@ -92,6 +92,8 @@ impl Connection {
             return Err(connection.last_error(rc));
         }
 
+        connection.exec_batch("PRAGMA foreign_keys = ON;")?;
+
         Ok(connection)
     }
 

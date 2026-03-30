@@ -2,7 +2,8 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::core::app_state::AppState;
-use crate::core::recorder::RecorderStatus;
+use crate::core::recorder::{RecorderStatus, RecorderTransportMode};
+use crate::core::retention::run_retention_cleanup;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +15,12 @@ pub struct RecorderStatusResponse {
     frame_count: i64,
     permissions: std::collections::BTreeMap<String, bool>,
     recorder_binary: String,
+    transport_mode: RecorderTransportMode,
+    transport_target: String,
+    transport_ready: bool,
+    protocol_version: Option<u32>,
+    protocol_min: Option<u32>,
+    protocol_capabilities: Vec<String>,
 }
 
 #[tauri::command]
@@ -48,6 +55,7 @@ pub fn stop_recording(state: State<'_, AppState>) -> Result<RecorderStatusRespon
         .map_err(|_| "recorder mutex poisoned".to_string())?
         .stop_capture()
         .map_err(|error| error.to_string())?;
+    let _ = run_retention_cleanup(state.storage(), state.recordings_root());
 
     Ok(map_status(status))
 }
@@ -61,5 +69,11 @@ fn map_status(status: RecorderStatus) -> RecorderStatusResponse {
         frame_count: status.frame_count,
         permissions: status.permissions,
         recorder_binary: status.recorder_binary,
+        transport_mode: status.transport_mode,
+        transport_target: status.transport_target,
+        transport_ready: status.transport_ready,
+        protocol_version: status.protocol_version,
+        protocol_min: status.protocol_min,
+        protocol_capabilities: status.protocol_capabilities,
     }
 }

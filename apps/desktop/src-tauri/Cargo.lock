@@ -316,6 +316,7 @@ dependencies = [
 name = "cloneaprocess-desktop"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "serde",
  "serde_json",
  "tauri",

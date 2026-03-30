@@ -7,9 +7,11 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "helpers:stage": "bash ../../scripts/stage-native-helpers.sh",
+    "xpc:install": "bash ../../scripts/install-bundled-xpc-service.sh",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "npm run helpers:stage && tauri build --bundles app && npm run xpc:install"
   },
   "dependencies": {
     "@cloneaprocess/trace-schema": "0.1.0",

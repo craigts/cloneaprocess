@@ -17,6 +17,10 @@ let package = Package(
             name: "RecorderService",
             path: "Sources/RecorderService"
         ),
+        .testTarget(
+            name: "RecorderServiceTests",
+            dependencies: ["RecorderService"],
+            path: "Tests/RecorderServiceTests"
+        ),
     ]
 )
-

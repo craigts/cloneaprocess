@@ -6,7 +6,21 @@ import ApplicationServices
 import AppKit
 #endif
 
+private let runnerProtocolVersion = 1
+private let runnerProtocolMinimumVersion = 1
+private let runnerProtocolCapabilities = [
+    "run_workflow",
+    "abort_run",
+    "event_stream",
+    "ax_actions",
+    "focus_window",
+    "set_text",
+    "menu_navigation",
+    "subprocess_bridge",
+]
+
 protocol RunnerActionPerforming {
+    func focusWindow(bundleId: String, title: String?) throws -> [String: Any]
     func click(selector: [String: Any]) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
     func selectMenu(path: [String]) throws -> [String: Any]
@@ -61,7 +75,7 @@ final class RunnerBridgeSession {
                     serializeReply(
                         id: requestId,
                         ok: true,
-                        payload: ["message": "pong"]
+                        payload: protocolHandshakePayload()
                     ),
                 ]
             case "run_workflow":
@@ -153,6 +167,11 @@ final class RunnerBridgeSession {
         }
 
         switch kind {
+        case "focusWindow":
+            guard let bundleId = step["bundleId"] as? String, !bundleId.isEmpty else {
+                throw RunnerServiceError.invalidRequest("focusWindow step requires bundleId")
+            }
+            return try performer.focusWindow(bundleId: bundleId, title: step["title"] as? String)
         case "click":
             guard let selector = step["selector"] as? [String: Any] else {
                 throw RunnerServiceError.invalidRequest("click step requires selector")
@@ -222,6 +241,14 @@ final class RunnerBridgeSession {
     }
 }
 
+func protocolHandshakePayload() -> [String: Any] {
+    [
+        "protocol_version": runnerProtocolVersion,
+        "protocol_min": runnerProtocolMinimumVersion,
+        "capabilities": runnerProtocolCapabilities,
+    ]
+}
+
 struct RunnerService {
     private let session: RunnerBridgeSession
 
@@ -251,6 +278,29 @@ struct RunnerService {
 }
 
 struct LiveRunnerActionPerformer: RunnerActionPerforming {
+    func focusWindow(bundleId: String, title: String?) throws -> [String: Any] {
+        #if canImport(AppKit)
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else {
+            throw RunnerServiceError.executionFailed("application \(bundleId) is not running")
+        }
+        let activated = app.activate()
+        guard activated else {
+            throw RunnerServiceError.executionFailed("failed to activate application \(bundleId)")
+        }
+        var result: [String: Any] = [
+            "action": "focusWindow",
+            "bundleId": bundleId,
+        ]
+        if let title {
+            result["title"] = title
+        }
+        return result
+        #else
+        _ = title
+        throw RunnerServiceError.executionFailed("window focus is only available on macOS")
+        #endif
+    }
+
     func click(selector: [String: Any]) throws -> [String: Any] {
         let element = try resolveElement(selector: selector)
         let result = AXUIElementPerformAction(element, kAXPressAction as CFString)

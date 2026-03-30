@@ -17,3 +17,28 @@ commands.allow = ["list_session_events"]
 identifier = "allow-load-keyframe-bytes"
 description = "Enables the load_keyframe_bytes command without any pre-configured scope."
 commands.allow = ["load_keyframe_bytes"]
+
+[[permission]]
+identifier = "allow-list-workflow-runs"
+description = "Enables the list_workflow_runs command without any pre-configured scope."
+commands.allow = ["list_workflow_runs"]
+
+[[permission]]
+identifier = "allow-list-workflow-run-logs"
+description = "Enables the list_workflow_run_logs command without any pre-configured scope."
+commands.allow = ["list_workflow_run_logs"]
+
+[[permission]]
+identifier = "allow-get-retention-policy"
+description = "Enables the get_retention_policy command without any pre-configured scope."
+commands.allow = ["get_retention_policy"]
+
+[[permission]]
+identifier = "allow-update-retention-policy"
+description = "Enables the update_retention_policy command without any pre-configured scope."
+commands.allow = ["update_retention_policy"]
+
+[[permission]]
+identifier = "allow-run-retention-cleanup-now"
+description = "Enables the run_retention_cleanup_now command without any pre-configured scope."
+commands.allow = ["run_retention_cleanup_now"]

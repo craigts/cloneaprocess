@@ -24,8 +24,11 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": "all",
+    "resources": {
+      "resources/macos/RecorderService": "helpers/macos/RecorderService",
+      "resources/macos/RunnerService": "helpers/macos/RunnerService"
+    }
   }
 }
-

@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
 
-use crate::core::recorder::RecorderCoordinator;
+use crate::core::helper_paths::{NativeHelper, resolve_helper_binary};
+use crate::core::recorder::{RecorderCoordinator, RecorderTransportConfig};
+use crate::core::retention::run_retention_cleanup;
 use crate::storage::{Storage, StorageError};
 
 pub struct AppState {
@@ -13,6 +15,7 @@ pub struct AppState {
     recordings_root: PathBuf,
     storage: Storage,
     recorder: Mutex<RecorderCoordinator>,
+    runner_binary: PathBuf,
 }
 
 impl AppState {
@@ -26,7 +29,9 @@ impl AppState {
             .map_err(|source| StorageError::io(recordings_root.clone(), source))?;
 
         let storage = Storage::bootstrap(app_data_dir.join("storage").join("cloneaprocess.sqlite3"))?;
-        let recorder_binary = resolve_recorder_binary(app);
+        let _ = run_retention_cleanup(&storage, &recordings_root);
+        let recorder_transport = resolve_recorder_transport(app);
+        let runner_binary = resolve_helper_binary(app, NativeHelper::Runner);
 
         Ok(Self {
             started_at_ms: SystemTime::now()
@@ -34,8 +39,9 @@ impl AppState {
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0),
             recordings_root,
-            recorder: Mutex::new(RecorderCoordinator::new(storage.clone(), recorder_binary)),
+            recorder: Mutex::new(RecorderCoordinator::new(storage.clone(), recorder_transport)),
             storage,
+            runner_binary,
         })
     }
 
@@ -54,40 +60,51 @@ impl AppState {
     pub fn recorder(&self) -> &Mutex<RecorderCoordinator> {
         &self.recorder
     }
+
+    pub fn runner_binary(&self) -> &Path {
+        self.runner_binary.as_path()
+    }
 }
 
-fn resolve_recorder_binary(app: &AppHandle) -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| manifest_dir.clone());
-
-    let repo_relative = PathBuf::from("native")
-        .join("mac-recorder-service")
-        .join(".build")
-        .join("debug")
-        .join("RecorderService");
-
-    let mut candidates = vec![
-        workspace_root.join(&repo_relative),
-        manifest_dir.join("..").join("..").join("..").join(&repo_relative),
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&repo_relative),
-    ];
-
-    if let Ok(resource_path) = app.path().resolve(
-        "../../native/mac-recorder-service/.build/debug/RecorderService",
-        tauri::path::BaseDirectory::Resource,
-    ) {
-        candidates.push(resource_path);
+fn resolve_recorder_transport(app: &AppHandle) -> RecorderTransportConfig {
+    match std::env::var("CLONEAPROCESS_RECORDER_TRANSPORT")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("xpc_bundle_service") => RecorderTransportConfig::xpc_bundle_service(
+            std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
+        ),
+        Some("xpc") | Some("xpc_service") => RecorderTransportConfig::xpc_service(
+            std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
+        ),
+        _ if bundled_recorder_service_exists() => RecorderTransportConfig::xpc_bundle_service(
+            std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
+        ),
+        _ => RecorderTransportConfig::subprocess_bridge(resolve_helper_binary(app, NativeHelper::Recorder)),
     }
+}
 
-    candidates
-        .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| workspace_root.join(repo_relative))
+fn bundled_recorder_service_exists() -> bool {
+    let service_root = match std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|macos_dir| macos_dir.parent().map(Path::to_path_buf))
+        .map(|contents_dir| contents_dir.join("XPCServices").join("RecorderService.xpc"))
+    {
+        Some(path) => path,
+        None => return false,
+    };
+
+    service_root.join("Contents").join("Info.plist").exists()
+        && service_root.join("Contents").join("MacOS").join("RecorderService").exists()
 }

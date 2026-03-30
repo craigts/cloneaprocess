@@ -2,3 +2,18 @@
 identifier = "allow-compile-workflow-preview"
 description = "Enables the compile_workflow_preview command without any pre-configured scope."
 commands.allow = ["compile_workflow_preview"]
+
+[[permission]]
+identifier = "allow-execute-session-workflow"
+description = "Enables the execute_session_workflow command without any pre-configured scope."
+commands.allow = ["execute_session_workflow"]
+
+[[permission]]
+identifier = "allow-approve-workflow-run"
+description = "Enables the approve_workflow_run command without any pre-configured scope."
+commands.allow = ["approve_workflow_run"]
+
+[[permission]]
+identifier = "allow-reject-workflow-run"
+description = "Enables the reject_workflow_run command without any pre-configured scope."
+commands.allow = ["reject_workflow_run"]

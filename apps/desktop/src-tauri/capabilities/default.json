@@ -15,6 +15,14 @@
     "allow-list-sessions",
     "allow-list-session-events",
     "allow-load-keyframe-bytes",
-    "allow-compile-workflow-preview"
+    "allow-list-workflow-runs",
+    "allow-list-workflow-run-logs",
+    "allow-get-retention-policy",
+    "allow-update-retention-policy",
+    "allow-run-retention-cleanup-now",
+    "allow-compile-workflow-preview",
+    "allow-execute-session-workflow",
+    "allow-approve-workflow-run",
+    "allow-reject-workflow-run"
   ]
 }

@@ -6,6 +6,18 @@ struct MockRunnerActionPerformer: RunnerActionPerforming {
     var failOnKind: String?
     let recorder: InvocationRecorder
 
+    func focusWindow(bundleId: String, title: String?) throws -> [String: Any] {
+        recorder.record("focusWindow:\(bundleId)")
+        if failOnKind == "focusWindow" {
+            throw RunnerServiceError.executionFailed("focusWindow failed")
+        }
+        var payload: [String: Any] = ["action": "focusWindow", "bundleId": bundleId]
+        if let title {
+            payload["title"] = title
+        }
+        return payload
+    }
+
     func click(selector: [String: Any]) throws -> [String: Any] {
         recorder.record("click")
         if failOnKind == "click" {
@@ -23,7 +35,7 @@ struct MockRunnerActionPerformer: RunnerActionPerforming {
     }
 
     func selectMenu(path: [String]) throws -> [String: Any] {
-        recorder.record("selectMenu:\(path.joined(separator: \">\"))")
+        recorder.record("selectMenu:\(path.joined(separator: ">"))")
         if failOnKind == "selectMenu" {
             throw RunnerServiceError.executionFailed("selectMenu failed")
         }
@@ -39,19 +51,35 @@ final class InvocationRecorder {
     }
 }
 
+@Test func pingReplyIncludesProtocolMetadata() throws {
+    let recorder = InvocationRecorder()
+    let session = RunnerBridgeSession(performer: MockRunnerActionPerformer(failOnKind: nil, recorder: recorder))
+
+    let lines = session.handle(jsonLine: """
+    {"id":"req_ping","type":"ping","payload":{}}
+    """)
+
+    #expect(lines.count == 1)
+    #expect(lines[0].contains("\"ok\":true"))
+    #expect(lines[0].contains("\"protocol_version\":1"))
+    #expect(lines[0].contains("\"protocol_min\":1"))
+    #expect(lines[0].contains("\"capabilities\""))
+    #expect(lines[0].contains("run_workflow"))
+}
+
 @Test func runWorkflowEmitsReplyAndCompletionEvents() throws {
     let recorder = InvocationRecorder()
     let session = RunnerBridgeSession(performer: MockRunnerActionPerformer(failOnKind: nil, recorder: recorder))
 
     let lines = session.handle(jsonLine: """
-    {"id":"req_1","type":"run_workflow","payload":{"workflow_id":"wf_1","run_id":"run_1","steps":[{"kind":"click","selector":{"ax":{"role":"AXButton","title":"Save"}}},{"kind":"setText","selector":{"ax":{"role":"AXTextField","title":"Name"}},"value":{"kind":"literal","value":"Alice"}},{"kind":"selectMenu","path":["File","New"]}]}}
+    {"id":"req_1","type":"run_workflow","payload":{"workflow_id":"wf_1","run_id":"run_1","steps":[{"kind":"focusWindow","bundleId":"com.apple.TextEdit"},{"kind":"click","selector":{"ax":{"role":"AXButton","title":"Save"}}},{"kind":"setText","selector":{"ax":{"role":"AXTextField","title":"Name"}},"value":{"kind":"literal","value":"Alice"}},{"kind":"selectMenu","path":["File","New"]}]}}
     """)
 
-    #expect(lines.count == 9)
-    #expect(recorder.invocations == ["click", "setText:Alice", "selectMenu:File>New"])
+    #expect(lines.count == 11)
+    #expect(recorder.invocations == ["focusWindow:com.apple.TextEdit", "click", "setText:Alice", "selectMenu:File>New"])
     #expect(lines[0].contains("\"ok\":true"))
     #expect(lines[1].contains("\"type\":\"run_started\""))
-    #expect(lines[8].contains("\"type\":\"run_completed\""))
+    #expect(lines[10].contains("\"type\":\"run_completed\""))
 }
 
 @Test func runWorkflowFailureEmitsRunFailed() throws {

@@ -4,6 +4,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 vite_port=5173
+recorder_xpc_service="${CLONEAPROCESS_RECORDER_XPC_SERVICE:-com.cloneaprocess.recorder.dev}"
 
 cleanup_port_listener() {
   local port="$1"
@@ -31,16 +32,18 @@ cleanup_port_listener() {
 
 cleanup_port_listener "$vite_port"
 
-echo "[cloneaprocess] building mac-recorder-service (incremental)"
-cd "$repo_root/native/mac-recorder-service"
-swift build
+echo "[cloneaprocess] staging native helpers"
+cd "$repo_root"
+bash "$repo_root/scripts/stage-native-helpers.sh"
 
-echo "[cloneaprocess] building mac-runner-service (incremental)"
-cd "$repo_root/native/mac-runner-service"
-swift build
+echo "[cloneaprocess] bootstrapping recorder XPC launch agent"
+export CLONEAPROCESS_RECORDER_HELPER_PATH="$repo_root/apps/desktop/src-tauri/resources/macos/RecorderService"
+bash "$repo_root/scripts/bootstrap-recorder-xpc.sh"
 
 cleanup_port_listener "$vite_port"
 
 echo "[cloneaprocess] launching desktop app"
 cd "$repo_root"
+export CLONEAPROCESS_RECORDER_TRANSPORT="xpc_service"
+export CLONEAPROCESS_RECORDER_XPC_SERVICE="$recorder_xpc_service"
 npm run tauri:dev --workspace @cloneaprocess/desktop

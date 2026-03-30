@@ -15,6 +15,11 @@ typedef void (*xpc_event_cb)(const char *event_json, void *user_data);
 typedef void (*xpc_reply_cb)(const char *reply_json, void *user_data);
 typedef void (*xpc_error_cb)(int32_t code, const char *message, void *user_data);
 
+typedef enum xpc_connection_kind_t {
+    XPC_CONNECTION_KIND_MACH_SERVICE = 0,
+    XPC_CONNECTION_KIND_BUNDLED_SERVICE = 1,
+} xpc_connection_kind_t;
+
 // Return codes.
 // 0 = OK
 // -1 = invalid args
@@ -25,7 +30,12 @@ typedef void (*xpc_error_cb)(int32_t code, const char *message, void *user_data)
 // service_name examples:
 // - "com.yourapp.recorder"
 // - "com.yourapp.runner"
-xpc_client_t *xpc_client_create(const char *service_name, xpc_error_cb on_error, void *user_data);
+xpc_client_t *xpc_client_create(
+    const char *service_name,
+    xpc_connection_kind_t connection_kind,
+    xpc_error_cb on_error,
+    void *user_data
+);
 
 // Connect/disconnect lifecycle.
 int32_t xpc_client_connect(xpc_client_t *client);

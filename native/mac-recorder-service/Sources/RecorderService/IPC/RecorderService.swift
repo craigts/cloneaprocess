@@ -24,7 +24,7 @@ import ScreenCaptureKit
 }
 
 @objc protocol RecorderServiceXPC {
-    func ping(_ reply: @escaping (String) -> Void)
+    func ping(_ reply: @escaping ([String: Any]) -> Void)
     func getPermissions(_ reply: @escaping ([String: Bool]) -> Void)
     func beginCapture(_ config: [String: Any], reply: @escaping ([String: Any]) -> Void)
     func endCapture(_ sessionId: String, reply: @escaping ([String: Any]) -> Void)
@@ -32,7 +32,11 @@ import ScreenCaptureKit
     func unsubscribeEvents(_ reply: @escaping ([String: Any]) -> Void)
 }
 
-final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
+struct RecorderEventEnvelope: @unchecked Sendable {
+    let value: [String: Any]
+}
+
+final class RecorderServiceImpl: NSObject, RecorderServiceXPC, @unchecked Sendable {
     private let enableEventTap = true
     private let enableAXSnapshots = true
     private let enableKeyframes = true
@@ -49,8 +53,8 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
     private let frameCaptureQueue = DispatchQueue(label: "com.cloneaprocess.recorder.frame-capture")
     private let accessibilityQueue = DispatchQueue(label: "com.cloneaprocess.recorder.accessibility")
 
-    func ping(_ reply: @escaping (String) -> Void) {
-        reply("pong")
+    func ping(_ reply: @escaping ([String: Any]) -> Void) {
+        reply(protocolHandshakePayload())
     }
 
     func bridgeAccessibilityGranted() -> Bool {
@@ -328,16 +332,16 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             payload["name"] = localizedName
         }
 
-        let envelope: [String: Any] = [
+        let envelope = RecorderEventEnvelope(value: [
             "v": 1,
             "id": "evt_\(UUID().uuidString.lowercased())",
             "ts": nowMs(),
             "type": "frontmost_app_changed",
             "payload": payload,
-        ]
+        ])
 
         eventDeliveryQueue.async { [weak self] in
-            self?.emitEvent(envelope)
+            self?.emitEvent(envelope.value)
         }
         #endif
     }
@@ -359,16 +363,16 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC {
             payload["key_code"] = event.getIntegerValueField(.keyboardEventKeycode)
         }
 
-        let envelope: [String: Any] = [
+        let envelope = RecorderEventEnvelope(value: [
             "v": 1,
             "id": "evt_\(UUID().uuidString.lowercased())",
             "ts": nowMs(),
             "type": eventType,
             "payload": payload,
-        ]
+        ])
 
         eventDeliveryQueue.async { [weak self] in
-            self?.emitEvent(envelope)
+            self?.emitEvent(envelope.value)
         }
 
         if shouldCaptureAXSnapshot(for: type) {
@@ -715,7 +719,6 @@ final class RecorderServiceDelegate: NSObject, NSXPCListenerDelegate {
             argumentIndex: 0,
             ofReply: true
         )
-
         newConnection.exportedInterface = interface
         newConnection.exportedObject = exportedObject
         newConnection.resume()
@@ -724,7 +727,7 @@ final class RecorderServiceDelegate: NSObject, NSXPCListenerDelegate {
 }
 
 private func xpcAllowedClasses(_ classes: [AnyClass]) -> Set<AnyHashable> {
-    Set(classes.map { AnyHashable(ObjectIdentifier($0)) })
+    NSSet(array: classes) as? Set<AnyHashable> ?? []
 }
 
 struct RecorderService {
@@ -733,6 +736,10 @@ struct RecorderService {
 
     init(listener: NSXPCListener = .service()) {
         self.listener = listener
+    }
+
+    init(machServiceName: String) {
+        self.listener = NSXPCListener(machServiceName: machServiceName)
     }
 
     func run() {
@@ -748,11 +755,12 @@ enum RecorderBridgeEmitter {
 
 final class RecorderBridgeEmitterState: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.cloneaprocess.recorder.bridge-emitter")
-    var handler: (([String: Any]) -> Void)?
+    var handler: (@Sendable (RecorderEventEnvelope) -> Void)?
 
     func emit(_ event: [String: Any]) {
+        let envelope = RecorderEventEnvelope(value: event)
         queue.async { [handler] in
-            handler?(event)
+            handler?(envelope)
         }
     }
 }
