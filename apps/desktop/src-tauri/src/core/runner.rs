@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Debug)]
 pub enum RunnerError {
@@ -40,7 +40,9 @@ impl Display for RunnerError {
         match self {
             Self::Io(error) => write!(f, "runner io error: {}", error),
             Self::InvalidProtocol(message) => write!(f, "runner protocol error: {}", message),
-            Self::Remote { code, message, .. } => write!(f, "runner remote error {}: {}", code, message),
+            Self::Remote { code, message, .. } => {
+                write!(f, "runner remote error {}: {}", code, message)
+            }
             Self::Timeout {
                 operation,
                 stderr_tail,
@@ -138,7 +140,9 @@ impl RunnerBridge {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                let Ok(mut tail) = stderr_tail_reader.lock() else { break };
+                let Ok(mut tail) = stderr_tail_reader.lock() else {
+                    break;
+                };
                 if tail.len() >= 12 {
                     tail.pop_front();
                 }
@@ -235,26 +239,22 @@ impl RunnerStepExecutor for RunnerBridge {
                     let Some(event_type) = message.get("type").and_then(Value::as_str) else {
                         continue;
                     };
-                    let payload = message
-                        .get("payload")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
+                    let payload = message.get("payload").cloned().unwrap_or_else(|| json!({}));
 
                     match event_type {
                         "step_finished" => {
                             if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                                 last_step_result = Some(
-                                    payload
-                                        .get("result")
-                                        .cloned()
-                                        .unwrap_or_else(|| json!({})),
+                                    payload.get("result").cloned().unwrap_or_else(|| json!({})),
                                 );
                             } else {
-                                last_step_error = Some(parse_event_error(&payload).unwrap_or_else(|| {
-                                    RunnerError::InvalidProtocol(
-                                        "runner step_finished event missing error payload".to_string(),
-                                    )
-                                }));
+                                last_step_error =
+                                    Some(parse_event_error(&payload).unwrap_or_else(|| {
+                                        RunnerError::InvalidProtocol(
+                                            "runner step_finished event missing error payload"
+                                                .to_string(),
+                                        )
+                                    }));
                             }
                         }
                         "run_completed" => {

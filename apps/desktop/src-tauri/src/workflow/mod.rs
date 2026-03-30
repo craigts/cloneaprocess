@@ -4,7 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::core::runner::{RunnerBridge, RunnerError, RunnerStepExecutor, RunnerStepRequest};
-use crate::storage::{NewWorkflowRun, NewWorkflowRunLog, RawEventRecord, Storage, WorkflowRunRecord};
+use crate::storage::{
+    NewWorkflowRun, NewWorkflowRunLog, RawEventRecord, Storage, WorkflowRunRecord,
+};
 
 pub const WORKFLOW_IR_VERSION: u32 = 1;
 
@@ -63,7 +65,11 @@ struct TextEntryContext {
     value: String,
 }
 
-pub fn compile_workflow(session_id: i64, workflow_name: String, events: &[RawEventRecord]) -> Result<WorkflowDraft, String> {
+pub fn compile_workflow(
+    session_id: i64,
+    workflow_name: String,
+    events: &[RawEventRecord],
+) -> Result<WorkflowDraft, String> {
     let mut context = DraftContext {
         last_bundle_id: None,
         pending_snapshot: None,
@@ -74,16 +80,12 @@ pub fn compile_workflow(session_id: i64, workflow_name: String, events: &[RawEve
     for event in events {
         let envelope: Value = serde_json::from_str(&event.event_json)
             .map_err(|error| format!("failed to parse event {}: {}", event.id, error))?;
-        let payload = envelope
-            .get("payload")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let payload = event_payload(&envelope);
 
         match event.event_type.as_str() {
             "frontmost_app_changed" => {
                 flush_text_entry(&mut context);
-                if let Some(bundle_id) = payload.get("bundle_id").and_then(Value::as_str) {
+                if let Some(bundle_id) = payload.get("bundleId").and_then(Value::as_str) {
                     if context.last_bundle_id.as_deref() != Some(bundle_id) {
                         context.steps.push(json!({
                             "kind": "focusWindow",
@@ -127,7 +129,8 @@ pub fn compile_workflow(session_id: i64, workflow_name: String, events: &[RawEve
             }
             "key_down" => {
                 if let Some(text_entry) = context.active_text_entry.as_mut() {
-                    let key_code = payload.get("key_code").and_then(Value::as_i64).unwrap_or(-1) as i32;
+                    let key_code =
+                        payload.get("keyCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
                     match translate_key_code(key_code) {
                         Some(KeyInput::Text(fragment)) => text_entry.value.push_str(fragment),
                         Some(KeyInput::Backspace) => {
@@ -155,7 +158,18 @@ pub fn compile_workflow(session_id: i64, workflow_name: String, events: &[RawEve
         .map(Vec::len)
         .unwrap_or(0);
 
-    Ok(WorkflowDraft { workflow, step_count })
+    Ok(WorkflowDraft {
+        workflow,
+        step_count,
+    })
+}
+
+fn event_payload(envelope: &Value) -> serde_json::Map<String, Value> {
+    if let Some(payload) = envelope.get("payload").and_then(Value::as_object) {
+        return payload.clone();
+    }
+
+    serde_json::Map::new()
 }
 
 pub fn execute_workflow(
@@ -329,8 +343,8 @@ fn resumable_execution_state(
         .failed_step_index
         .ok_or_else(|| "awaiting approval run is missing failed step index".to_string())?
         as usize;
-    let workflow: Value =
-        serde_json::from_str(&run.workflow_json).map_err(|error| format!("invalid workflow json: {}", error))?;
+    let workflow: Value = serde_json::from_str(&run.workflow_json)
+        .map_err(|error| format!("invalid workflow json: {}", error))?;
     let steps = workflow
         .get("steps")
         .and_then(Value::as_array)
@@ -384,10 +398,9 @@ fn continue_workflow_execution<R: RunnerStepExecutor>(
     for step_index in state.resume_step_index..state.steps.len() {
         let step = &state.steps[step_index];
         if let Some(request) = approval_request_for_step(step) {
-            let is_preapproved = matches!(
-                state.approval_decision,
-                Some(ApprovalDecision::Approved)
-            ) && step_index == state.resume_step_index;
+            let is_preapproved =
+                matches!(state.approval_decision, Some(ApprovalDecision::Approved))
+                    && step_index == state.resume_step_index;
 
             if !is_preapproved {
                 append_run_log(
@@ -646,7 +659,11 @@ fn risky_phrase_from_selector(selector: &Value) -> Option<(&'static str, &'stati
     for field in ["title", "description", "valueHint", "identifier"] {
         let value = ax.get(field).and_then(Value::as_str)?;
         if let Some((category, keyword)) = risky_phrase(value) {
-            return Some((category, keyword, format!("selector {} \"{}\"", field, value)));
+            return Some((
+                category,
+                keyword,
+                format!("selector {} \"{}\"", field, value),
+            ));
         }
     }
     None
@@ -870,12 +887,14 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        ApprovalDecision, compile_workflow, continue_workflow_execution, execute_workflow_with_runner,
-        reject_workflow_run, resumable_execution_state,
+        compile_workflow, continue_workflow_execution, execute_workflow_with_runner,
+        reject_workflow_run, resumable_execution_state, ApprovalDecision,
     };
-    use crate::core::runner::{RunnerError, RunnerStepExecutor, RunnerStepRequest, RunnerStepResult};
+    use crate::core::runner::{
+        RunnerError, RunnerStepExecutor, RunnerStepRequest, RunnerStepResult,
+    };
     use crate::storage::{RawEventRecord, Storage};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     struct MockRunner {
         outcomes: VecDeque<Result<Value, RunnerError>>,
@@ -925,12 +944,18 @@ mod tests {
             .expect("steps array should exist");
 
         assert_eq!(workflow.step_count, 5);
-        assert_eq!(steps[0], json!({ "kind": "focusWindow", "bundleId": "com.apple.TextEdit" }));
+        assert_eq!(
+            steps[0],
+            json!({ "kind": "focusWindow", "bundleId": "com.apple.TextEdit" })
+        );
         assert_eq!(steps[1]["kind"], "waitFor");
         assert_eq!(steps[2]["kind"], "click");
         assert_eq!(steps[3]["kind"], "setText");
         assert_eq!(steps[3]["value"]["value"], "hello");
-        assert_eq!(steps[4], json!({ "kind": "focusWindow", "bundleId": "com.apple.Safari" }));
+        assert_eq!(
+            steps[4],
+            json!({ "kind": "focusWindow", "bundleId": "com.apple.Safari" })
+        );
     }
 
     #[test]
@@ -941,21 +966,32 @@ mod tests {
                 0,
                 "ax_snapshot",
                 json!({
+                    "schemaVersion": 1,
                     "payload": {
                         "role": "AXButton",
                         "selector": {
-                            "target_app": { "bundle_id": "com.apple.TextEdit" },
+                            "targetApp": { "bundleId": "com.apple.TextEdit" },
                             "ax": { "role": "AXButton", "title": "Submit" }
                         }
                     }
                 }),
             ),
-            raw_event(2, 1, "mouse_down", json!({ "payload": { "x": 100, "y": 100 } })),
-            raw_event(3, 2, "key_down", json!({ "payload": { "key_code": 12 } })),
+            raw_event(
+                2,
+                1,
+                "mouse_down",
+                json!({ "schemaVersion": 1, "payload": { "x": 100, "y": 100 } }),
+            ),
+            raw_event(
+                3,
+                2,
+                "key_down",
+                json!({ "schemaVersion": 1, "payload": { "keyCode": 12 } }),
+            ),
         ];
 
-        let workflow = compile_workflow(7, "No text".to_string(), &events)
-            .expect("workflow should compile");
+        let workflow =
+            compile_workflow(7, "No text".to_string(), &events).expect("workflow should compile");
         let steps = workflow
             .workflow
             .get("steps")
@@ -970,7 +1006,8 @@ mod tests {
     #[test]
     fn executes_workflow_and_persists_run_logs() {
         let root = unique_test_dir();
-        let storage = Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
+        let storage =
+            Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
         let workflow = json!({
             "id": "wf_exec",
             "name": "Executor Smoke",
@@ -1002,7 +1039,9 @@ mod tests {
         let logs = storage
             .list_workflow_run_logs(summary.run_row_id, 20)
             .expect("logs should load");
-        assert!(logs.iter().any(|log| log.event_type == "step_attempt_started"));
+        assert!(logs
+            .iter()
+            .any(|log| log.event_type == "step_attempt_started"));
         assert!(logs.iter().any(|log| log.event_type == "step_finished"));
         assert!(logs.iter().any(|log| log.event_type == "run_completed"));
 
@@ -1012,7 +1051,8 @@ mod tests {
     #[test]
     fn retries_retryable_step_and_records_failure_metadata() {
         let root = unique_test_dir();
-        let storage = Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
+        let storage =
+            Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
         let workflow = json!({
             "id": "wf_retry",
             "name": "Retry Workflow",
@@ -1057,7 +1097,9 @@ mod tests {
         let logs = storage
             .list_workflow_run_logs(summary.run_row_id, 20)
             .expect("logs should load");
-        assert!(logs.iter().any(|log| log.event_type == "step_retry_scheduled"));
+        assert!(logs
+            .iter()
+            .any(|log| log.event_type == "step_retry_scheduled"));
         assert!(logs.iter().any(|log| log.event_type == "run_failed"));
 
         let _ = fs::remove_dir_all(&root);
@@ -1066,7 +1108,8 @@ mod tests {
     #[test]
     fn risky_step_pauses_for_approval_and_can_resume() {
         let root = unique_test_dir();
-        let storage = Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
+        let storage =
+            Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
         let workflow = json!({
             "id": "wf_approval",
             "name": "Approval Workflow",
@@ -1076,12 +1119,16 @@ mod tests {
         });
         let mut initial_runner = MockRunner::new(vec![Ok(json!({ "action": "click" }))]);
 
-        let initial_summary = execute_workflow_with_runner(&storage, &mut initial_runner, &workflow, None)
-            .expect("workflow should return approval summary");
+        let initial_summary =
+            execute_workflow_with_runner(&storage, &mut initial_runner, &workflow, None)
+                .expect("workflow should return approval summary");
 
         assert_eq!(initial_summary.status, "awaiting_approval");
         assert_eq!(initial_summary.completed_step_count, 0);
-        assert!(initial_runner.seen_kinds.is_empty(), "risky step should not execute before approval");
+        assert!(
+            initial_runner.seen_kinds.is_empty(),
+            "risky step should not execute before approval"
+        );
 
         let run = storage
             .get_workflow_run(initial_summary.run_row_id)
@@ -1102,7 +1149,9 @@ mod tests {
         let logs = storage
             .list_workflow_run_logs(initial_summary.run_row_id, 20)
             .expect("logs should load");
-        assert!(logs.iter().any(|log| log.event_type == "approval_requested"));
+        assert!(logs
+            .iter()
+            .any(|log| log.event_type == "approval_requested"));
         assert!(logs.iter().any(|log| log.event_type == "approval_approved"));
         assert!(logs.iter().any(|log| log.event_type == "run_completed"));
 
@@ -1112,7 +1161,8 @@ mod tests {
     #[test]
     fn risky_step_can_be_rejected_without_execution() {
         let root = unique_test_dir();
-        let storage = Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
+        let storage =
+            Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
         let workflow = json!({
             "id": "wf_reject",
             "name": "Reject Workflow",
@@ -1125,10 +1175,13 @@ mod tests {
         let initial_summary = execute_workflow_with_runner(&storage, &mut runner, &workflow, None)
             .expect("workflow should return approval summary");
         assert_eq!(initial_summary.status, "awaiting_approval");
-        assert!(runner.seen_kinds.is_empty(), "risky menu action should not execute before approval");
+        assert!(
+            runner.seen_kinds.is_empty(),
+            "risky menu action should not execute before approval"
+        );
 
-        let rejected_summary = reject_workflow_run(&storage, initial_summary.run_row_id)
-            .expect("run should reject");
+        let rejected_summary =
+            reject_workflow_run(&storage, initial_summary.run_row_id).expect("run should reject");
         assert_eq!(rejected_summary.status, "rejected");
         assert_eq!(rejected_summary.completed_step_count, 0);
 
@@ -1147,33 +1200,64 @@ mod tests {
                 1,
                 0,
                 "frontmost_app_changed",
-                json!({ "payload": { "bundle_id": "com.apple.TextEdit" } }),
+                json!({ "schemaVersion": 1, "payload": { "bundleId": "com.apple.TextEdit" } }),
             ),
             raw_event(
                 2,
                 1,
                 "ax_snapshot",
                 json!({
+                    "schemaVersion": 1,
                     "payload": {
                         "role": "AXTextField",
                         "selector": {
-                            "target_app": { "bundle_id": "com.apple.TextEdit" },
+                            "targetApp": { "bundleId": "com.apple.TextEdit" },
                             "ax": { "role": "AXTextField", "title": "Name" }
                         }
                     }
                 }),
             ),
-            raw_event(3, 2, "mouse_down", json!({ "payload": { "x": 120, "y": 220 } })),
-            raw_event(4, 3, "key_down", json!({ "payload": { "key_code": 4 } })),
-            raw_event(5, 4, "key_down", json!({ "payload": { "key_code": 14 } })),
-            raw_event(6, 5, "key_down", json!({ "payload": { "key_code": 37 } })),
-            raw_event(7, 6, "key_down", json!({ "payload": { "key_code": 37 } })),
-            raw_event(8, 7, "key_down", json!({ "payload": { "key_code": 31 } })),
+            raw_event(
+                3,
+                2,
+                "mouse_down",
+                json!({ "schemaVersion": 1, "payload": { "x": 120, "y": 220 } }),
+            ),
+            raw_event(
+                4,
+                3,
+                "key_down",
+                json!({ "schemaVersion": 1, "payload": { "keyCode": 4 } }),
+            ),
+            raw_event(
+                5,
+                4,
+                "key_down",
+                json!({ "schemaVersion": 1, "payload": { "keyCode": 14 } }),
+            ),
+            raw_event(
+                6,
+                5,
+                "key_down",
+                json!({ "schemaVersion": 1, "payload": { "keyCode": 37 } }),
+            ),
+            raw_event(
+                7,
+                6,
+                "key_down",
+                json!({ "schemaVersion": 1, "payload": { "keyCode": 37 } }),
+            ),
+            raw_event(
+                8,
+                7,
+                "key_down",
+                json!({ "schemaVersion": 1, "payload": { "keyCode": 31 } }),
+            ),
             raw_event(
                 9,
                 8,
                 "frontmost_app_changed",
-                json!({ "payload": { "bundle_id": "com.apple.Safari" } }),
+                json!({ "schemaVersion": 1, "payload": { "bundleId": "com.apple.Safari" } }),
             ),
         ]
     }

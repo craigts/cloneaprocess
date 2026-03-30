@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::core::trace::normalize_raw_event;
+
 use super::sqlite::Connection;
 use super::{StorageError, STORAGE_SCHEMA_VERSION};
 
@@ -231,7 +233,8 @@ pub struct NewWorkflowRunLog {
 impl Storage {
     pub fn bootstrap(db_path: PathBuf) -> Result<Self, StorageError> {
         if let Some(parent) = db_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| StorageError::io(parent.to_path_buf(), source))?;
+            fs::create_dir_all(parent)
+                .map_err(|source| StorageError::io(parent.to_path_buf(), source))?;
         }
 
         let storage = Self { db_path };
@@ -434,21 +437,18 @@ impl Storage {
 
     pub fn retention_policy(&self) -> Result<RetentionPolicy, StorageError> {
         Ok(RetentionPolicy {
-            max_completed_sessions: self
-                .app_setting_u32(
-                    "retention.max_completed_sessions",
-                    DEFAULT_RETENTION_MAX_COMPLETED_SESSIONS,
-                )?,
-            max_session_age_days: self
-                .app_setting_u32(
-                    "retention.max_session_age_days",
-                    DEFAULT_RETENTION_MAX_SESSION_AGE_DAYS,
-                )?,
-            orphan_grace_hours: self
-                .app_setting_u32(
-                    "retention.orphan_grace_hours",
-                    DEFAULT_RETENTION_ORPHAN_GRACE_HOURS,
-                )?,
+            max_completed_sessions: self.app_setting_u32(
+                "retention.max_completed_sessions",
+                DEFAULT_RETENTION_MAX_COMPLETED_SESSIONS,
+            )?,
+            max_session_age_days: self.app_setting_u32(
+                "retention.max_session_age_days",
+                DEFAULT_RETENTION_MAX_SESSION_AGE_DAYS,
+            )?,
+            orphan_grace_hours: self.app_setting_u32(
+                "retention.orphan_grace_hours",
+                DEFAULT_RETENTION_ORPHAN_GRACE_HOURS,
+            )?,
         })
     }
 
@@ -776,7 +776,10 @@ impl Storage {
         Ok(rows)
     }
 
-    pub fn list_keyframe_paths_for_session(&self, session_id: i64) -> Result<Vec<String>, StorageError> {
+    pub fn list_keyframe_paths_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<String>, StorageError> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             r#"
@@ -804,7 +807,10 @@ impl Storage {
         Ok(())
     }
 
-    pub fn next_workflow_run_log_sequence(&self, workflow_run_id: i64) -> Result<i64, StorageError> {
+    pub fn next_workflow_run_log_sequence(
+        &self,
+        workflow_run_id: i64,
+    ) -> Result<i64, StorageError> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             r#"
@@ -818,7 +824,10 @@ impl Storage {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn get_workflow_run(&self, workflow_run_id: i64) -> Result<Option<WorkflowRunRecord>, StorageError> {
+    pub fn get_workflow_run(
+        &self,
+        workflow_run_id: i64,
+    ) -> Result<Option<WorkflowRunRecord>, StorageError> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             r#"
@@ -929,10 +938,22 @@ impl Storage {
     fn migrate(&self) -> Result<(), StorageError> {
         let connection = self.open_connection()?;
         connection.exec_batch(BOOTSTRAP_SQL)?;
-        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN app_transition_count INTEGER NOT NULL DEFAULT 0")?;
-        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN ax_snapshot_count INTEGER NOT NULL DEFAULT 0")?;
-        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN keyframe_count_cached INTEGER NOT NULL DEFAULT 0")?;
-        apply_optional_migration(&connection, "ALTER TABLE sessions ADD COLUMN last_error TEXT")?;
+        apply_optional_migration(
+            &connection,
+            "ALTER TABLE sessions ADD COLUMN app_transition_count INTEGER NOT NULL DEFAULT 0",
+        )?;
+        apply_optional_migration(
+            &connection,
+            "ALTER TABLE sessions ADD COLUMN ax_snapshot_count INTEGER NOT NULL DEFAULT 0",
+        )?;
+        apply_optional_migration(
+            &connection,
+            "ALTER TABLE sessions ADD COLUMN keyframe_count_cached INTEGER NOT NULL DEFAULT 0",
+        )?;
+        apply_optional_migration(
+            &connection,
+            "ALTER TABLE sessions ADD COLUMN last_error TEXT",
+        )?;
         connection.exec_batch(
             r#"
             UPDATE sessions
@@ -956,6 +977,7 @@ impl Storage {
                 )
             "#,
         )?;
+        normalize_stored_raw_events(&connection)?;
 
         let mut statement = connection.prepare(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (?, ?)",
@@ -1010,6 +1032,51 @@ impl Storage {
     }
 }
 
+fn normalize_stored_raw_events(connection: &Connection) -> Result<(), StorageError> {
+    let mut select = connection.prepare(
+        r#"
+        SELECT id, event_type, event_json, recorded_at_ms
+        FROM raw_events
+        ORDER BY id ASC
+        "#,
+    )?;
+
+    let mut rewrites = Vec::new();
+    while select.step()? {
+        let event_id = select.column_int64(0);
+        let event_type = select.column_text(1)?.unwrap_or_default();
+        let event_json = select.column_text(2)?.unwrap_or_default();
+        let recorded_at_ms = select.column_int64(3) as u64;
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&event_json) else {
+            continue;
+        };
+        let Ok(normalized) = normalize_raw_event(Some(&event_type), &value, recorded_at_ms) else {
+            continue;
+        };
+
+        if normalized.event_json != event_json || normalized.recorded_at_ms != recorded_at_ms {
+            rewrites.push((event_id, normalized.event_json, normalized.recorded_at_ms));
+        }
+    }
+
+    for (event_id, event_json, recorded_at_ms) in rewrites {
+        let mut update = connection.prepare(
+            r#"
+            UPDATE raw_events
+            SET event_json = ?, recorded_at_ms = ?
+            WHERE id = ?
+            "#,
+        )?;
+        update.bind_text(1, &event_json)?;
+        update.bind_int64(2, recorded_at_ms as i64)?;
+        update.bind_int64(3, event_id)?;
+        update.execute()?;
+    }
+
+    Ok(())
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1031,9 +1098,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DEFAULT_RETENTION_MAX_COMPLETED_SESSIONS, DEFAULT_RETENTION_MAX_SESSION_AGE_DAYS,
-        DEFAULT_RETENTION_ORPHAN_GRACE_HOURS, NewKeyframe, NewRawEvent, NewSession, NewWorkflowRun,
-        NewWorkflowRunLog, RetentionPolicy, Storage,
+        NewKeyframe, NewRawEvent, NewSession, NewWorkflowRun, NewWorkflowRunLog, RetentionPolicy,
+        Storage, DEFAULT_RETENTION_MAX_COMPLETED_SESSIONS, DEFAULT_RETENTION_MAX_SESSION_AGE_DAYS,
+        DEFAULT_RETENTION_ORPHAN_GRACE_HOURS,
     };
 
     #[test]
@@ -1041,7 +1108,8 @@ mod tests {
         let root = unique_test_dir();
         let db_path = root.join("storage").join("cloneaprocess.sqlite3");
 
-        let storage = Storage::bootstrap(db_path.clone()).expect("storage bootstrap should succeed");
+        let storage =
+            Storage::bootstrap(db_path.clone()).expect("storage bootstrap should succeed");
         assert!(db_path.exists(), "database file should be created");
 
         let session_id = storage
@@ -1064,8 +1132,16 @@ mod tests {
             })
             .expect("raw event insert should succeed");
         assert!(event_id > 0, "raw event row id should be positive");
-        assert_eq!(storage.session_count().expect("session count should load"), 1);
-        assert_eq!(storage.raw_event_count().expect("raw event count should load"), 1);
+        assert_eq!(
+            storage.session_count().expect("session count should load"),
+            1
+        );
+        assert_eq!(
+            storage
+                .raw_event_count()
+                .expect("raw event count should load"),
+            1
+        );
 
         let sessions = storage.list_sessions(10).expect("sessions should load");
         assert_eq!(sessions.len(), 1);
@@ -1090,7 +1166,12 @@ mod tests {
             })
             .expect("keyframe insert should succeed");
         assert!(keyframe_id > 0, "keyframe row id should be positive");
-        assert_eq!(storage.keyframe_count().expect("keyframe count should load"), 1);
+        assert_eq!(
+            storage
+                .keyframe_count()
+                .expect("keyframe count should load"),
+            1
+        );
         storage
             .update_session_summary(session_id, 3, 2, 1, Some("helper exited"))
             .expect("session summary should update");
@@ -1098,7 +1179,9 @@ mod tests {
         storage
             .complete_session(session_id, 3)
             .expect("session should complete");
-        let sessions = storage.list_sessions(10).expect("sessions should still load");
+        let sessions = storage
+            .list_sessions(10)
+            .expect("sessions should still load");
         assert_eq!(sessions[0].status, "completed");
         assert_eq!(sessions[0].ended_at_ms, Some(3));
         assert_eq!(sessions[0].app_transition_count, 3);
@@ -1118,7 +1201,10 @@ mod tests {
                 step_count: 2,
             })
             .expect("workflow run insert should succeed");
-        assert!(workflow_run_id > 0, "workflow run row id should be positive");
+        assert!(
+            workflow_run_id > 0,
+            "workflow run row id should be positive"
+        );
 
         let workflow_log_id = storage
             .append_workflow_run_log(&NewWorkflowRunLog {
@@ -1130,7 +1216,10 @@ mod tests {
                 recorded_at_ms: 5,
             })
             .expect("workflow run log insert should succeed");
-        assert!(workflow_log_id > 0, "workflow run log row id should be positive");
+        assert!(
+            workflow_log_id > 0,
+            "workflow run log row id should be positive"
+        );
 
         storage
             .complete_workflow_run(workflow_run_id, "completed", 6, 2, None, None)
@@ -1170,7 +1259,9 @@ mod tests {
             })
             .expect("retention policy should update");
         assert_eq!(
-            storage.retention_policy().expect("retention policy should reload"),
+            storage
+                .retention_policy()
+                .expect("retention policy should reload"),
             RetentionPolicy {
                 max_completed_sessions: 12,
                 max_session_age_days: 5,
@@ -1181,14 +1272,79 @@ mod tests {
         let keyframe_paths = storage
             .list_keyframe_paths_for_session(session_id)
             .expect("keyframe paths should load");
-        assert_eq!(keyframe_paths, vec!["recordings/sess_smoke/frames/frm_smoke.jpg".to_string()]);
+        assert_eq!(
+            keyframe_paths,
+            vec!["recordings/sess_smoke/frames/frm_smoke.jpg".to_string()]
+        );
 
         storage
             .delete_session(session_id)
             .expect("session delete should succeed");
-        assert_eq!(storage.session_count().expect("session count should update"), 0);
-        assert_eq!(storage.raw_event_count().expect("raw event count should update"), 0);
-        assert_eq!(storage.keyframe_count().expect("keyframe count should update"), 0);
+        assert_eq!(
+            storage
+                .session_count()
+                .expect("session count should update"),
+            0
+        );
+        assert_eq!(
+            storage
+                .raw_event_count()
+                .expect("raw event count should update"),
+            0
+        );
+        assert_eq!(
+            storage
+                .keyframe_count()
+                .expect("keyframe count should update"),
+            0
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrates_legacy_event_payloads_to_canonical_schema() {
+        let root = unique_test_dir();
+        let db_path = root.join("storage").join("cloneaprocess.sqlite3");
+
+        let storage =
+            Storage::bootstrap(db_path.clone()).expect("storage bootstrap should succeed");
+        let session_id = storage
+            .insert_session(&NewSession {
+                external_id: "sess_legacy".to_string(),
+                label: Some("Legacy capture".to_string()),
+                started_at_ms: 1,
+                status: "recording".to_string(),
+            })
+            .expect("session insert should succeed");
+        storage
+            .insert_raw_event(&NewRawEvent {
+                session_id,
+                sequence: 0,
+                event_type: "ax_snapshot".to_string(),
+                event_json: r#"{"v":1,"id":"evt_legacy","ts":12,"type":"ax_snapshot","payload":{"snapshot_id":"ax_legacy","selector":{"target_app":{"bundle_id":"com.apple.TextEdit"}}}}"#.to_string(),
+                recorded_at_ms: 12,
+            })
+            .expect("legacy event insert should succeed");
+        drop(storage);
+
+        let storage =
+            Storage::bootstrap(db_path.clone()).expect("storage re-bootstrap should succeed");
+        let events = storage
+            .list_raw_events_for_session(session_id, 10)
+            .expect("events should load");
+        let event_json: serde_json::Value =
+            serde_json::from_str(&events[0].event_json).expect("event should parse");
+
+        assert_eq!(event_json["schemaVersion"], 1);
+        assert_eq!(event_json["sourceVersion"], 1);
+        assert_eq!(event_json["eventId"], "evt_legacy");
+        assert_eq!(event_json["recordedAtMs"], 12);
+        assert_eq!(event_json["payload"]["snapshotId"], "ax_legacy");
+        assert_eq!(
+            event_json["payload"]["selector"]["targetApp"]["bundleId"],
+            "com.apple.TextEdit"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

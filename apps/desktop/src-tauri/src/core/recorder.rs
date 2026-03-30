@@ -6,14 +6,15 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::thread::{JoinHandle, sleep};
+use std::thread::{sleep, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Value};
 
-use crate::storage::{NewKeyframe, NewRawEvent, NewSession, Storage, StorageError};
 use crate::core::recorder_xpc::{RecorderXpcClient, RecorderXpcTransportKind};
+use crate::core::trace::{normalize_raw_event, NormalizedRawEvent};
+use crate::storage::{NewKeyframe, NewRawEvent, NewSession, Storage, StorageError};
 
 #[derive(Debug)]
 pub enum RecorderError {
@@ -27,7 +28,9 @@ pub enum RecorderError {
 impl std::fmt::Display for RecorderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BinaryNotFound(path) => write!(f, "recorder binary not found at {}", path.display()),
+            Self::BinaryNotFound(path) => {
+                write!(f, "recorder binary not found at {}", path.display())
+            }
             Self::Io(error) => write!(f, "io error: {}", error),
             Self::Json(error) => write!(f, "json error: {}", error),
             Self::Storage(error) => write!(f, "storage error: {}", error),
@@ -152,7 +155,6 @@ impl RecorderTransportConfig {
 
 const BRIDGE_START_TIMEOUT: Duration = Duration::from_secs(3);
 const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-const STORED_EVENT_SCHEMA_VERSION: u32 = 1;
 
 struct RecorderProcess {
     child: Child,
@@ -192,26 +194,6 @@ struct RecorderProtocolHandshake {
     protocol_version: u32,
     protocol_min: u32,
     capabilities: Vec<String>,
-}
-
-#[derive(Debug, PartialEq)]
-struct NormalizedEventEnvelope {
-    event_id: String,
-    event_type: String,
-    recorded_at_ms: u64,
-    payload: Map<String, Value>,
-}
-
-impl NormalizedEventEnvelope {
-    fn as_json(&self) -> Value {
-        json!({
-            "schema_version": STORED_EVENT_SCHEMA_VERSION,
-            "event_id": self.event_id,
-            "event_type": self.event_type,
-            "recorded_at_ms": self.recorded_at_ms,
-            "payload": self.payload,
-        })
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,18 +241,29 @@ impl BridgeDiagnostics {
             parts.push(format!("helper {}", exit));
         }
         if self.malformed_stdout_lines > 0 {
-            parts.push(format!("malformed_stdout_lines={}", self.malformed_stdout_lines));
+            parts.push(format!(
+                "malformed_stdout_lines={}",
+                self.malformed_stdout_lines
+            ));
         }
         if !self.telemetry_tail.is_empty() {
             parts.push(format!(
                 "telemetry=[{}]",
-                self.telemetry_tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+                self.telemetry_tail
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             ));
         }
         if !self.stderr_tail.is_empty() {
             parts.push(format!(
                 "stderr=[{}]",
-                self.stderr_tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+                self.stderr_tail
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             ));
         }
 
@@ -296,14 +289,17 @@ impl RecorderCoordinator {
             (_, Some(session)) => (
                 active_session_state(session)?
                     .lock()
-                    .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?
+                    .map_err(|_| {
+                        RecorderError::Protocol("recorder state mutex poisoned".to_string())
+                    })?
                     .permissions
                     .clone(),
                 None,
             ),
             (RecorderTransportConfig::SubprocessBridge { .. }, None) => (self.permissions()?, None),
             (
-                RecorderTransportConfig::XpcMachService { .. } | RecorderTransportConfig::XpcBundledService { .. },
+                RecorderTransportConfig::XpcMachService { .. }
+                | RecorderTransportConfig::XpcBundledService { .. },
                 None,
             ) => match self.permissions() {
                 Ok(permissions) => (permissions, None),
@@ -318,18 +314,17 @@ impl RecorderCoordinator {
         let transport_target = self.transport.target();
         let transport_ready = match &self.transport {
             RecorderTransportConfig::SubprocessBridge { .. } => self.transport.is_ready(),
-            RecorderTransportConfig::XpcMachService { .. } | RecorderTransportConfig::XpcBundledService { .. } => {
-                protocol_handshake.is_some()
-            }
+            RecorderTransportConfig::XpcMachService { .. }
+            | RecorderTransportConfig::XpcBundledService { .. } => protocol_handshake.is_some(),
         };
         let transport_error = handshake_error.or(permissions_error);
         let recorder_binary = self.transport.recorder_binary();
 
         Ok(match &self.session {
             Some(session) => {
-                let state = active_session_state(session)?
-                    .lock()
-                    .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
+                let state = active_session_state(session)?.lock().map_err(|_| {
+                    RecorderError::Protocol("recorder state mutex poisoned".to_string())
+                })?;
 
                 RecorderStatus {
                     active: true,
@@ -343,8 +338,12 @@ impl RecorderCoordinator {
                     transport_target,
                     transport_ready,
                     transport_error,
-                    protocol_version: protocol_handshake.as_ref().map(|handshake| handshake.protocol_version),
-                    protocol_min: protocol_handshake.as_ref().map(|handshake| handshake.protocol_min),
+                    protocol_version: protocol_handshake
+                        .as_ref()
+                        .map(|handshake| handshake.protocol_version),
+                    protocol_min: protocol_handshake
+                        .as_ref()
+                        .map(|handshake| handshake.protocol_min),
                     protocol_capabilities: protocol_handshake
                         .as_ref()
                         .map(|handshake| handshake.capabilities.clone())
@@ -363,8 +362,12 @@ impl RecorderCoordinator {
                 transport_target,
                 transport_ready,
                 transport_error,
-                protocol_version: protocol_handshake.as_ref().map(|handshake| handshake.protocol_version),
-                protocol_min: protocol_handshake.as_ref().map(|handshake| handshake.protocol_min),
+                protocol_version: protocol_handshake
+                    .as_ref()
+                    .map(|handshake| handshake.protocol_version),
+                protocol_min: protocol_handshake
+                    .as_ref()
+                    .map(|handshake| handshake.protocol_min),
                 protocol_capabilities: protocol_handshake
                     .as_ref()
                     .map(|handshake| handshake.capabilities.clone())
@@ -386,10 +389,16 @@ impl RecorderCoordinator {
                 self.start_subprocess_capture(binary_path.clone())?;
             }
             RecorderTransportConfig::XpcMachService { service_name } => {
-                self.start_xpc_capture(service_name.clone(), RecorderXpcTransportKind::MachService)?;
+                self.start_xpc_capture(
+                    service_name.clone(),
+                    RecorderXpcTransportKind::MachService,
+                )?;
             }
             RecorderTransportConfig::XpcBundledService { service_name } => {
-                self.start_xpc_capture(service_name.clone(), RecorderXpcTransportKind::BundledService)?;
+                self.start_xpc_capture(
+                    service_name.clone(),
+                    RecorderXpcTransportKind::BundledService,
+                )?;
             }
         }
 
@@ -417,9 +426,18 @@ impl RecorderCoordinator {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let stdin = child.stdin.take().ok_or_else(|| RecorderError::Protocol("missing stdin".to_string()))?;
-        let stdout = child.stdout.take().ok_or_else(|| RecorderError::Protocol("missing stdout".to_string()))?;
-        let stderr = child.stderr.take().ok_or_else(|| RecorderError::Protocol("missing stderr".to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| RecorderError::Protocol("missing stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RecorderError::Protocol("missing stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RecorderError::Protocol("missing stderr".to_string()))?;
         let diagnostics = Arc::new(Mutex::new(BridgeDiagnostics::default()));
         let events_rx = spawn_bridge_reader(stdout, diagnostics.clone());
         let stderr_thread = spawn_stderr_reader(stderr, diagnostics.clone());
@@ -431,7 +449,8 @@ impl RecorderCoordinator {
             "permissions",
             BRIDGE_START_TIMEOUT,
         )?;
-        let permissions: BTreeMap<String, bool> = serde_json::from_value(permissions_message.payload)?;
+        let permissions: BTreeMap<String, bool> =
+            serde_json::from_value(permissions_message.payload)?;
 
         let session_message = wait_for_message(
             &events_rx,
@@ -440,22 +459,20 @@ impl RecorderCoordinator {
             "capture_started",
             BRIDGE_START_TIMEOUT,
         )?;
-        let session_payload: CaptureStartedPayload = serde_json::from_value(session_message.payload)?;
+        let session_payload: CaptureStartedPayload =
+            serde_json::from_value(session_message.payload)?;
         if !session_payload.ok {
             drop(stdin);
             let _ = child.kill();
             let _ = child.wait();
-            return Err(RecorderError::Protocol(
-                format!(
-                    "{} ({})",
-                    session_payload
+            return Err(RecorderError::Protocol(format!(
+                "{} ({})",
+                session_payload
                     .error
                     .unwrap_or_else(|| "capture_start_failed".to_string()),
-                    bridge_summary(&diagnostics)
-                ),
-            ));
+                bridge_summary(&diagnostics)
+            )));
         }
-
         let (state, ingest_thread) = self.build_active_capture(
             "Bridge capture".to_string(),
             permissions,
@@ -502,12 +519,18 @@ impl RecorderCoordinator {
         if !session_payload.ok {
             let _ = client.unsubscribe_events(BRIDGE_STOP_TIMEOUT);
             return Err(RecorderError::Protocol(
-                session_payload.error.unwrap_or_else(|| "capture_start_failed".to_string()),
+                session_payload
+                    .error
+                    .unwrap_or_else(|| "capture_start_failed".to_string()),
             ));
         }
 
-        let (state, ingest_thread) =
-            self.build_active_capture("XPC capture".to_string(), permissions, session_payload, events_rx)?;
+        let (state, ingest_thread) = self.build_active_capture(
+            "XPC capture".to_string(),
+            permissions,
+            session_payload,
+            events_rx,
+        )?;
 
         self.session = Some(ActiveRecorderSession::Xpc(XpcRecorderSession {
             client,
@@ -523,13 +546,19 @@ impl RecorderCoordinator {
         permissions: BTreeMap<String, bool>,
         session_payload: CaptureStartedPayload,
         events_rx: Receiver<Value>,
-    ) -> Result<(Arc<Mutex<ActiveCapture>>, JoinHandle<Result<(), RecorderError>>), RecorderError> {
-        let session_external_id = session_payload
-            .session_id
-            .ok_or_else(|| RecorderError::Protocol("capture_started missing session_id".to_string()))?;
-        let started_at_ms = session_payload
-            .started_at
-            .ok_or_else(|| RecorderError::Protocol("capture_started missing started_at".to_string()))?;
+    ) -> Result<
+        (
+            Arc<Mutex<ActiveCapture>>,
+            JoinHandle<Result<(), RecorderError>>,
+        ),
+        RecorderError,
+    > {
+        let session_external_id = session_payload.session_id.ok_or_else(|| {
+            RecorderError::Protocol("capture_started missing session_id".to_string())
+        })?;
+        let started_at_ms = session_payload.started_at.ok_or_else(|| {
+            RecorderError::Protocol("capture_started missing started_at".to_string())
+        })?;
         let session_row_id = self.storage.insert_session(&NewSession {
             external_id: session_external_id.clone(),
             label: Some(label),
@@ -552,7 +581,10 @@ impl RecorderCoordinator {
         Ok((state, ingest_thread))
     }
 
-    fn stop_subprocess_capture(&self, mut process: RecorderProcess) -> Result<RecorderStatus, RecorderError> {
+    fn stop_subprocess_capture(
+        &self,
+        mut process: RecorderProcess,
+    ) -> Result<RecorderStatus, RecorderError> {
         send_command(&mut process.stdin, "stop")?;
         drop(process.stdin);
 
@@ -599,7 +631,10 @@ impl RecorderCoordinator {
         self.build_stopped_status(&state)
     }
 
-    fn stop_xpc_capture(&self, mut session: XpcRecorderSession) -> Result<RecorderStatus, RecorderError> {
+    fn stop_xpc_capture(
+        &self,
+        mut session: XpcRecorderSession,
+    ) -> Result<RecorderStatus, RecorderError> {
         let session_external_id = session
             .state
             .lock()
@@ -638,9 +673,8 @@ impl RecorderCoordinator {
         let protocol_handshake = self.protocol_handshake().ok();
         let transport_ready = match &self.transport {
             RecorderTransportConfig::SubprocessBridge { .. } => self.transport.is_ready(),
-            RecorderTransportConfig::XpcMachService { .. } | RecorderTransportConfig::XpcBundledService { .. } => {
-                protocol_handshake.is_some()
-            }
+            RecorderTransportConfig::XpcMachService { .. }
+            | RecorderTransportConfig::XpcBundledService { .. } => protocol_handshake.is_some(),
         };
 
         Ok(RecorderStatus {
@@ -655,8 +689,12 @@ impl RecorderCoordinator {
             transport_target: self.transport.target(),
             transport_ready,
             transport_error: None,
-            protocol_version: protocol_handshake.as_ref().map(|handshake| handshake.protocol_version),
-            protocol_min: protocol_handshake.as_ref().map(|handshake| handshake.protocol_min),
+            protocol_version: protocol_handshake
+                .as_ref()
+                .map(|handshake| handshake.protocol_version),
+            protocol_min: protocol_handshake
+                .as_ref()
+                .map(|handshake| handshake.protocol_min),
             protocol_capabilities: protocol_handshake
                 .map(|handshake| handshake.capabilities)
                 .unwrap_or_default(),
@@ -670,9 +708,13 @@ impl RecorderCoordinator {
                     return Ok(BTreeMap::new());
                 }
 
-                let output = Command::new(binary_path).arg("--permissions-json").output()?;
+                let output = Command::new(binary_path)
+                    .arg("--permissions-json")
+                    .output()?;
                 if !output.status.success() {
-                    return Err(RecorderError::Protocol("failed to read recorder permissions".to_string()));
+                    return Err(RecorderError::Protocol(
+                        "failed to read recorder permissions".to_string(),
+                    ));
                 }
 
                 let permissions = serde_json::from_slice::<BTreeMap<String, bool>>(&output.stdout)?;
@@ -682,9 +724,11 @@ impl RecorderCoordinator {
             | RecorderTransportConfig::XpcBundledService { service_name } => {
                 let client = RecorderXpcClient::connect(
                     service_name,
-                    self.transport.xpc_transport_kind().expect("xpc transport kind"),
+                    self.transport
+                        .xpc_transport_kind()
+                        .expect("xpc transport kind"),
                 )
-                    .map_err(|error| RecorderError::Protocol(error.to_string()))?;
+                .map_err(|error| RecorderError::Protocol(error.to_string()))?;
                 let permissions = serde_json::from_str::<BTreeMap<String, bool>>(
                     &client
                         .get_permissions(BRIDGE_START_TIMEOUT)
@@ -704,19 +748,24 @@ impl RecorderCoordinator {
 
                 let output = Command::new(binary_path).arg("--protocol-json").output()?;
                 if !output.status.success() {
-                    return Err(RecorderError::Protocol("failed to read recorder protocol metadata".to_string()));
+                    return Err(RecorderError::Protocol(
+                        "failed to read recorder protocol metadata".to_string(),
+                    ));
                 }
 
-                let handshake = serde_json::from_slice::<RecorderProtocolHandshake>(&output.stdout)?;
+                let handshake =
+                    serde_json::from_slice::<RecorderProtocolHandshake>(&output.stdout)?;
                 Ok(handshake)
             }
             RecorderTransportConfig::XpcMachService { service_name }
             | RecorderTransportConfig::XpcBundledService { service_name } => {
                 let client = RecorderXpcClient::connect(
                     service_name,
-                    self.transport.xpc_transport_kind().expect("xpc transport kind"),
+                    self.transport
+                        .xpc_transport_kind()
+                        .expect("xpc transport kind"),
                 )
-                    .map_err(|error| RecorderError::Protocol(error.to_string()))?;
+                .map_err(|error| RecorderError::Protocol(error.to_string()))?;
                 let handshake = serde_json::from_str::<RecorderProtocolHandshake>(
                     &client
                         .ping(BRIDGE_START_TIMEOUT)
@@ -736,7 +785,10 @@ struct CaptureStartedPayload {
     error: Option<String>,
 }
 
-fn spawn_bridge_reader(stdout: ChildStdout, diagnostics: Arc<Mutex<BridgeDiagnostics>>) -> Receiver<BridgeMessage> {
+fn spawn_bridge_reader(
+    stdout: ChildStdout,
+    diagnostics: Arc<Mutex<BridgeDiagnostics>>,
+) -> Receiver<BridgeMessage> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -775,7 +827,10 @@ fn wrap_bridge_events(rx: Receiver<BridgeMessage>) -> Receiver<Value> {
     wrapped_rx
 }
 
-fn spawn_stderr_reader(stderr: ChildStderr, diagnostics: Arc<Mutex<BridgeDiagnostics>>) -> JoinHandle<()> {
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+    diagnostics: Arc<Mutex<BridgeDiagnostics>>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
@@ -797,17 +852,33 @@ fn spawn_ingest_thread(
 ) -> JoinHandle<Result<(), RecorderError>> {
     thread::spawn(move || {
         while let Ok(payload) = rx.recv() {
-            let mut state_guard = state
-                .lock()
-                .map_err(|_| RecorderError::Protocol("recorder state mutex poisoned".to_string()))?;
-            let normalized = normalize_event_envelope(&payload, state_guard.next_sequence)?;
+            let normalized =
+                normalize_raw_event(None, &payload, now_ms()).map_err(RecorderError::Protocol)?;
             let event_type = normalized.event_type.clone();
+            let event_json = normalized.event_json.clone();
+            let bridge_error_message = if event_type == "bridge_error" {
+                serde_json::from_str::<serde_json::Value>(&event_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("payload")
+                            .and_then(|payload| payload.get("message"))
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned)
+                    })
+            } else {
+                None
+            };
+
+            let mut state_guard = state.lock().map_err(|_| {
+                RecorderError::Protocol("recorder state mutex poisoned".to_string())
+            })?;
 
             storage.insert_raw_event(&NewRawEvent {
                 session_id: state_guard.session_row_id,
                 sequence: state_guard.next_sequence,
                 event_type: event_type.clone(),
-                event_json: serde_json::to_string(&normalized.as_json())?,
+                event_json,
                 recorded_at_ms: normalized.recorded_at_ms,
             })?;
 
@@ -820,17 +891,13 @@ fn spawn_ingest_thread(
                 state_guard.ax_snapshot_count += 1;
             }
             if event_type == "screen_frame" {
-                if let Some(keyframe) = extract_keyframe(&normalized.payload, state_guard.session_row_id) {
+                if let Some(keyframe) = extract_keyframe(&normalized, state_guard.session_row_id) {
                     let _ = storage.insert_keyframe(&keyframe);
                 }
                 state_guard.frame_count += 1;
             }
             if event_type == "bridge_error" {
-                state_guard.last_error = payload
-                    .get("payload")
-                    .and_then(|value| value.get("message"))
-                    .and_then(|value| value.as_str())
-                    .map(ToOwned::to_owned);
+                state_guard.last_error = bridge_error_message;
             }
             storage.update_session_summary(
                 state_guard.session_row_id,
@@ -854,52 +921,10 @@ fn active_session_state(
     })
 }
 
-fn normalize_event_envelope(
-    payload: &Value,
-    fallback_sequence: i64,
-) -> Result<NormalizedEventEnvelope, RecorderError> {
-    let envelope = payload
-        .as_object()
-        .ok_or_else(|| RecorderError::Protocol("event envelope must be an object".to_string()))?;
-
-    let event_type = envelope
-        .get("event_type")
-        .or_else(|| envelope.get("type"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| RecorderError::Protocol("event envelope missing type".to_string()))?
-        .to_string();
-
-    let recorded_at_ms = envelope
-        .get("recorded_at_ms")
-        .or_else(|| envelope.get("ts"))
-        .and_then(Value::as_u64)
-        .unwrap_or_else(now_ms);
-
-    let event_id = envelope
-        .get("event_id")
-        .or_else(|| envelope.get("id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("evt_ingest_{}_{}", recorded_at_ms, fallback_sequence));
-
-    let event_payload = envelope
-        .get("payload")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    Ok(NormalizedEventEnvelope {
-        event_id,
-        event_type,
-        recorded_at_ms,
-        payload: event_payload,
-    })
-}
-
-fn extract_keyframe(event_payload: &Map<String, Value>, session_id: i64) -> Option<NewKeyframe> {
-    let frame_id = event_payload.get("frame_id")?.as_str()?.to_string();
+fn extract_keyframe(event: &NormalizedRawEvent, session_id: i64) -> Option<NewKeyframe> {
+    let payload: serde_json::Value = serde_json::from_str(&event.event_json).ok()?;
+    let event_payload = payload.get("payload")?.as_object()?;
+    let frame_id = event_payload.get("frameId")?.as_str()?.to_string();
     let relative_path = event_payload.get("path")?.as_str()?.to_string();
 
     Some(NewKeyframe {
@@ -1011,8 +1036,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BridgeDiagnostics, RecorderProtocolHandshake, RecorderTransportConfig, RecorderTransportMode,
-        STORED_EVENT_SCHEMA_VERSION, bridge_summary, normalize_event_envelope, push_bounded,
+        bridge_summary, push_bounded, BridgeDiagnostics, RecorderProtocolHandshake,
+        RecorderTransportConfig, RecorderTransportMode,
     };
 
     #[test]
@@ -1061,62 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bridge_event_to_canonical_schema() {
-        let normalized = normalize_event_envelope(
-            &json!({
-                "v": 1,
-                "id": "evt_123",
-                "ts": 42,
-                "type": "frontmost_app_changed",
-                "payload": {
-                    "bundle_id": "com.apple.TextEdit",
-                    "pid": 123,
-                },
-            }),
-            7,
-        )
-        .expect("bridge event should normalize");
-
-        assert_eq!(normalized.event_id, "evt_123");
-        assert_eq!(normalized.event_type, "frontmost_app_changed");
-        assert_eq!(normalized.recorded_at_ms, 42);
-        assert_eq!(
-            normalized.as_json(),
-            json!({
-                "schema_version": STORED_EVENT_SCHEMA_VERSION,
-                "event_id": "evt_123",
-                "event_type": "frontmost_app_changed",
-                "recorded_at_ms": 42,
-                "payload": {
-                    "bundle_id": "com.apple.TextEdit",
-                    "pid": 123,
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn normalizer_generates_event_id_when_bridge_omits_one() {
-        let normalized = normalize_event_envelope(
-            &json!({
-                "type": "mouse_down",
-                "ts": 99,
-                "payload": {
-                    "x": 10,
-                    "y": 20,
-                },
-            }),
-            3,
-        )
-        .expect("event without id should normalize");
-
-        assert_eq!(normalized.event_type, "mouse_down");
-        assert_eq!(normalized.recorded_at_ms, 99);
-        assert_eq!(normalized.payload.get("x").and_then(|value| value.as_i64()), Some(10));
-        assert_eq!(normalized.event_id, "evt_ingest_99_3");
-    }
-
-    #[test]
     fn protocol_handshake_deserializes_expected_shape() {
         let handshake: RecorderProtocolHandshake = serde_json::from_value(json!({
             "protocol_version": 1,
@@ -1132,7 +1101,8 @@ mod tests {
 
     #[test]
     fn xpc_transport_reports_expected_identity() {
-        let transport = RecorderTransportConfig::xpc_service("com.cloneaprocess.recorder.dev".to_string());
+        let transport =
+            RecorderTransportConfig::xpc_service("com.cloneaprocess.recorder.dev".to_string());
         let bundled_transport =
             RecorderTransportConfig::xpc_bundle_service("com.cloneaprocess.recorder".to_string());
 
@@ -1141,7 +1111,10 @@ mod tests {
         assert!(!transport.is_ready());
         assert!(transport.recorder_binary().is_empty());
 
-        assert_eq!(bundled_transport.mode(), RecorderTransportMode::XpcBundledService);
+        assert_eq!(
+            bundled_transport.mode(),
+            RecorderTransportMode::XpcBundledService
+        );
         assert_eq!(bundled_transport.target(), "com.cloneaprocess.recorder");
         assert!(!bundled_transport.is_ready());
         assert!(bundled_transport.recorder_binary().is_empty());

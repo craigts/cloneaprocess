@@ -6,16 +6,10 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum StorageError {
-    Io {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Io { path: PathBuf, source: io::Error },
     InvalidPath(PathBuf),
     PathResolution(String),
-    Sqlite {
-        code: i32,
-        message: String,
-    },
+    Sqlite { code: i32, message: String },
     CString(NulError),
 }
 

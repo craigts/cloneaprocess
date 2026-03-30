@@ -140,7 +140,10 @@ impl Connection {
         };
 
         let raw = NonNull::new(raw_statement).ok_or_else(|| {
-            StorageError::sqlite(rc, "sqlite3_prepare_v2 returned a null statement".to_string())
+            StorageError::sqlite(
+                rc,
+                "sqlite3_prepare_v2 returned a null statement".to_string(),
+            )
         })?;
 
         if rc != SQLITE_OK {

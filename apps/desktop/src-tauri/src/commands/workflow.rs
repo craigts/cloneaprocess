@@ -40,10 +40,15 @@ pub fn compile_workflow_preview(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("session {} not found", session_id))?;
 
-    let draft = workflow::compile_workflow(session_id, session.label.unwrap_or(session.external_id), &events)?;
+    let draft = workflow::compile_workflow(
+        session_id,
+        session.label.unwrap_or(session.external_id),
+        &events,
+    )?;
 
     Ok(WorkflowDraftResponse {
-        workflow_json: serde_json::to_string_pretty(&draft.workflow).map_err(|error| error.to_string())?,
+        workflow_json: serde_json::to_string_pretty(&draft.workflow)
+            .map_err(|error| error.to_string())?,
         step_count: draft.step_count,
     })
 }
@@ -62,7 +67,11 @@ pub fn execute_session_workflow(
         .get_session(session_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("session {} not found", session_id))?;
-    let draft = workflow::compile_workflow(session_id, session.label.unwrap_or(session.external_id), &events)?;
+    let draft = workflow::compile_workflow(
+        session_id,
+        session.label.unwrap_or(session.external_id),
+        &events,
+    )?;
     let summary = workflow::execute_workflow(
         state.storage(),
         state.runner_binary(),
@@ -88,11 +97,8 @@ pub fn approve_workflow_run(
     state: State<'_, AppState>,
     workflow_run_id: i64,
 ) -> Result<WorkflowExecutionResponse, String> {
-    let summary = workflow::approve_workflow_run(
-        state.storage(),
-        state.runner_binary(),
-        workflow_run_id,
-    )?;
+    let summary =
+        workflow::approve_workflow_run(state.storage(), state.runner_binary(), workflow_run_id)?;
 
     Ok(WorkflowExecutionResponse {
         run_row_id: summary.run_row_id,

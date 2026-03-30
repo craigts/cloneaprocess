@@ -71,17 +71,22 @@ pub fn resolve_helper_binary(app: &AppHandle, helper: NativeHelper) -> PathBuf {
 
     candidates.push(workspace_root.join(helper.repo_build_path()));
     candidates.push(workspace_root.join(helper.staged_repo_path()));
-    candidates.push(manifest_dir.join("resources").join("macos").join(helper.binary_name()));
+    candidates.push(
+        manifest_dir
+            .join("resources")
+            .join("macos")
+            .join(helper.binary_name()),
+    );
 
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join(helper.repo_build_path()));
         candidates.push(current_dir.join(helper.staged_repo_path()));
     }
 
-    if let Ok(resource_path) = app
-        .path()
-        .resolve(helper.bundled_resource_path(), tauri::path::BaseDirectory::Resource)
-    {
+    if let Ok(resource_path) = app.path().resolve(
+        helper.bundled_resource_path(),
+        tauri::path::BaseDirectory::Resource,
+    ) {
         candidates.push(resource_path);
     }
 
@@ -102,13 +107,14 @@ fn first_existing_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeHelper, first_existing_candidate};
+    use super::{first_existing_candidate, NativeHelper};
     use std::fs;
     use std::path::PathBuf;
 
     #[test]
     fn first_existing_candidate_prefers_first_match() {
-        let temp_root = std::env::temp_dir().join(format!("cloneaprocess-helper-test-{}", std::process::id()));
+        let temp_root =
+            std::env::temp_dir().join(format!("cloneaprocess-helper-test-{}", std::process::id()));
         let first = temp_root.join("first");
         let second = temp_root.join("second");
         fs::create_dir_all(&temp_root).expect("create temp root");

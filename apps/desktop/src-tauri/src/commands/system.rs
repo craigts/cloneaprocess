@@ -63,7 +63,11 @@ pub fn system_status(state: State<'_, AppState>) -> Result<SystemStatus, String>
         .map_err(|error| error.to_string())?;
     let recorder_binary_exists = !recorder_status.recorder_binary.is_empty()
         && Path::new(&recorder_status.recorder_binary).exists();
-    let storage_ready = storage_status.db_path.parent().map(Path::exists).unwrap_or(false);
+    let storage_ready = storage_status
+        .db_path
+        .parent()
+        .map(Path::exists)
+        .unwrap_or(false);
     let recordings_root_ready = state.recordings_root().exists();
     let recorder_protocol_compatible = is_protocol_compatible(
         recorder_status.protocol_version,
@@ -147,7 +151,11 @@ mod tests {
 
     #[test]
     fn protocol_is_compatible_for_expected_version_and_capabilities() {
-        let capabilities = vec!["event_stream".to_string(), "permissions".to_string(), "ax_snapshot".to_string()];
+        let capabilities = vec![
+            "event_stream".to_string(),
+            "permissions".to_string(),
+            "ax_snapshot".to_string(),
+        ];
         assert!(is_protocol_compatible(Some(1), Some(1), &capabilities));
     }
 

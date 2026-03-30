@@ -137,6 +137,11 @@ type ApprovalRequestPayload = {
 }
 
 type ParsedEventPayload = {
+  schemaVersion?: number
+  sourceVersion?: number
+  type?: string
+  eventId?: string
+  recordedAtMs?: number
   payload?: Record<string, unknown>
 }
 

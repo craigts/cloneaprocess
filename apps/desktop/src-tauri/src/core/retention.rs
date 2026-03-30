@@ -21,7 +21,10 @@ pub fn run_retention_cleanup(
 ) -> Result<RetentionCleanupReport, StorageError> {
     let policy = storage.retention_policy()?;
     let sessions = storage.list_sessions(i64::MAX)?;
-    let mut known_session_ids: HashSet<String> = sessions.iter().map(|session| session.external_id.clone()).collect();
+    let mut known_session_ids: HashSet<String> = sessions
+        .iter()
+        .map(|session| session.external_id.clone())
+        .collect();
     let active_session_ids: HashSet<String> = sessions
         .iter()
         .filter(|session| session.status == "recording")
@@ -39,8 +42,12 @@ pub fn run_retention_cleanup(
     let mut deleted_keyframe_file_count = 0_usize;
     let mut deleted_session_directory_count = 0_usize;
 
-    for session in sessions.iter().filter(|session| session.status != "recording") {
-        let over_count = policy.max_completed_sessions > 0 && completed_rank >= policy.max_completed_sessions;
+    for session in sessions
+        .iter()
+        .filter(|session| session.status != "recording")
+    {
+        let over_count =
+            policy.max_completed_sessions > 0 && completed_rank >= policy.max_completed_sessions;
         let too_old = cutoff_ms
             .map(|cutoff| session_age_reference_ms(session) < cutoff)
             .unwrap_or(false);
@@ -102,7 +109,9 @@ fn resolve_keyframe_path(recordings_root: &Path, stored_path: &str) -> PathBuf {
         return path;
     }
 
-    let stripped = stored_path.strip_prefix("recordings/").unwrap_or(stored_path);
+    let stripped = stored_path
+        .strip_prefix("recordings/")
+        .unwrap_or(stored_path);
     recordings_root.join(stripped)
 }
 
@@ -128,7 +137,9 @@ fn remove_orphan_session_directories(
     }
 
     let mut deleted = 0_usize;
-    for entry in fs::read_dir(root).map_err(|source| StorageError::io(root.to_path_buf(), source))? {
+    for entry in
+        fs::read_dir(root).map_err(|source| StorageError::io(root.to_path_buf(), source))?
+    {
         let entry = entry.map_err(|source| StorageError::io(root.to_path_buf(), source))?;
         let path = entry.path();
         if !path.is_dir() {
@@ -153,7 +164,8 @@ fn remove_orphan_session_directories(
 }
 
 fn directory_age_ms(path: &Path) -> Result<u64, StorageError> {
-    let metadata = fs::metadata(path).map_err(|source| StorageError::io(path.to_path_buf(), source))?;
+    let metadata =
+        fs::metadata(path).map_err(|source| StorageError::io(path.to_path_buf(), source))?;
     let modified_at = metadata
         .modified()
         .unwrap_or(SystemTime::UNIX_EPOCH)
@@ -261,7 +273,8 @@ mod tests {
         fs::create_dir_all(&orphan_dir).expect("orphan dir should exist");
         std::thread::sleep(Duration::from_millis(5));
 
-        let report = run_retention_cleanup(&storage, &recordings_root).expect("cleanup should succeed");
+        let report =
+            run_retention_cleanup(&storage, &recordings_root).expect("cleanup should succeed");
 
         assert_eq!(report.pruned_session_count, 1);
         assert_eq!(report.deleted_keyframe_file_count, 1);

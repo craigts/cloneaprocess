@@ -1,7 +1,7 @@
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -145,7 +145,9 @@ impl RecorderXpcClient {
             )
         };
         let Some(raw) = NonNull::new(raw) else {
-            unsafe { drop(Box::from_raw(error_state_ptr)); }
+            unsafe {
+                drop(Box::from_raw(error_state_ptr));
+            }
             return Err(RecorderXpcError::InvalidArgs("xpc_client_create"));
         };
 
@@ -176,33 +178,57 @@ impl RecorderXpcClient {
         })
     }
 
-    pub fn begin_capture(&self, config: &Value, timeout: Duration) -> Result<String, RecorderXpcError> {
+    pub fn begin_capture(
+        &self,
+        config: &Value,
+        timeout: Duration,
+    ) -> Result<String, RecorderXpcError> {
         let config = CString::new(serde_json::to_string(config)?)?;
-        self.call_reply(timeout, "recorder beginCapture", move |cb, user_data| unsafe {
-            xpc_recorder_begin_capture(self.raw.as_ptr(), config.as_ptr(), cb, user_data)
-        })
+        self.call_reply(
+            timeout,
+            "recorder beginCapture",
+            move |cb, user_data| unsafe {
+                xpc_recorder_begin_capture(self.raw.as_ptr(), config.as_ptr(), cb, user_data)
+            },
+        )
     }
 
-    pub fn end_capture(&self, session_id: &str, timeout: Duration) -> Result<String, RecorderXpcError> {
+    pub fn end_capture(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Result<String, RecorderXpcError> {
         let session_id = CString::new(session_id)?;
-        self.call_reply(timeout, "recorder endCapture", move |cb, user_data| unsafe {
-            xpc_recorder_end_capture(self.raw.as_ptr(), session_id.as_ptr(), cb, user_data)
-        })
+        self.call_reply(
+            timeout,
+            "recorder endCapture",
+            move |cb, user_data| unsafe {
+                xpc_recorder_end_capture(self.raw.as_ptr(), session_id.as_ptr(), cb, user_data)
+            },
+        )
     }
 
     pub fn subscribe_events(&mut self) -> Result<Receiver<Value>, RecorderXpcError> {
         if self.event_state_ptr.is_some() {
-            return Err(RecorderXpcError::Bridge("recorder events already subscribed".to_string()));
+            return Err(RecorderXpcError::Bridge(
+                "recorder events already subscribed".to_string(),
+            ));
         }
 
         let (tx, rx) = mpsc::channel();
         let event_state = Box::new(EventState { tx });
         let event_state_ptr = Box::into_raw(event_state);
         let code = unsafe {
-            xpc_recorder_subscribe_events(self.raw.as_ptr(), Some(xpc_event_callback), event_state_ptr.cast())
+            xpc_recorder_subscribe_events(
+                self.raw.as_ptr(),
+                Some(xpc_event_callback),
+                event_state_ptr.cast(),
+            )
         };
         if code != 0 {
-            unsafe { drop(Box::from_raw(event_state_ptr)); }
+            unsafe {
+                drop(Box::from_raw(event_state_ptr));
+            }
             return Err(map_return_code("recorder subscribeEvents", code));
         }
 
@@ -211,12 +237,18 @@ impl RecorderXpcClient {
     }
 
     pub fn unsubscribe_events(&mut self, timeout: Duration) -> Result<String, RecorderXpcError> {
-        let result = self.call_reply(timeout, "recorder unsubscribeEvents", |cb, user_data| unsafe {
-            xpc_recorder_unsubscribe_events(self.raw.as_ptr(), cb, user_data)
-        });
+        let result = self.call_reply(
+            timeout,
+            "recorder unsubscribeEvents",
+            |cb, user_data| unsafe {
+                xpc_recorder_unsubscribe_events(self.raw.as_ptr(), cb, user_data)
+            },
+        );
 
         if let Some(event_state_ptr) = self.event_state_ptr.take() {
-            unsafe { drop(Box::from_raw(event_state_ptr)); }
+            unsafe {
+                drop(Box::from_raw(event_state_ptr));
+            }
         }
 
         result
@@ -236,7 +268,9 @@ impl RecorderXpcClient {
         let reply_state_ptr = Box::into_raw(Box::new(ReplyState { tx: reply_tx }));
         let code = invoke(Some(xpc_reply_callback), reply_state_ptr.cast());
         if code != 0 {
-            unsafe { drop(Box::from_raw(reply_state_ptr)); }
+            unsafe {
+                drop(Box::from_raw(reply_state_ptr));
+            }
             return Err(map_return_code(op, code));
         }
 
@@ -248,7 +282,10 @@ impl RecorderXpcClient {
                     if let Some(error) = self.try_take_error() {
                         return Err(RecorderXpcError::Bridge(error));
                     }
-                    return Err(RecorderXpcError::Bridge(format!("{} reply callback disconnected", op)));
+                    return Err(RecorderXpcError::Bridge(format!(
+                        "{} reply callback disconnected",
+                        op
+                    )));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(error) = self.try_take_error() {
@@ -280,7 +317,9 @@ impl RecorderXpcClient {
 impl Drop for RecorderXpcClient {
     fn drop(&mut self) {
         if let Some(event_state_ptr) = self.event_state_ptr.take() {
-            unsafe { drop(Box::from_raw(event_state_ptr)); }
+            unsafe {
+                drop(Box::from_raw(event_state_ptr));
+            }
         }
         unsafe {
             xpc_client_disconnect(self.raw.as_ptr());
@@ -326,7 +365,11 @@ fn c_string_to_owned(value: *const c_char) -> Option<String> {
     if value.is_null() {
         return None;
     }
-    Some(unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn map_return_code(op: &'static str, code: c_int) -> RecorderXpcError {
@@ -364,13 +407,19 @@ mod tests {
     fn dev_xpc_client_can_ping_and_fetch_permissions() {
         let service_name = std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
             .unwrap_or_else(|_| "com.cloneaprocess.recorder.dev".to_string());
-        let client = RecorderXpcClient::connect(&service_name, RecorderXpcTransportKind::MachService)
-            .expect("xpc client should connect");
+        let client =
+            RecorderXpcClient::connect(&service_name, RecorderXpcTransportKind::MachService)
+                .expect("xpc client should connect");
 
-        let ping = client.ping(Duration::from_secs(3)).expect("ping should succeed");
-        let handshake: serde_json::Value = serde_json::from_str(&ping).expect("ping should return json");
+        let ping = client
+            .ping(Duration::from_secs(3))
+            .expect("ping should succeed");
+        let handshake: serde_json::Value =
+            serde_json::from_str(&ping).expect("ping should return json");
         assert_eq!(
-            handshake.get("protocol_version").and_then(|value| value.as_u64()),
+            handshake
+                .get("protocol_version")
+                .and_then(|value| value.as_u64()),
             Some(1)
         );
 
@@ -396,7 +445,10 @@ mod tests {
         let output = Command::new(&executable)
             .arg("--probe-recorder-xpc")
             .env("CLONEAPROCESS_RECORDER_TRANSPORT", "xpc_bundle_service")
-            .env("CLONEAPROCESS_RECORDER_XPC_SERVICE", "com.cloneaprocess.recorder")
+            .env(
+                "CLONEAPROCESS_RECORDER_XPC_SERVICE",
+                "com.cloneaprocess.recorder",
+            )
             .output()
             .expect("probe command should launch");
 
@@ -408,7 +460,10 @@ mod tests {
 
         let payload: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("probe output should be json");
-        assert_eq!(payload.get("ok").and_then(|value| value.as_bool()), Some(true));
+        assert_eq!(
+            payload.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
+        );
         assert_eq!(
             payload.get("transport").and_then(|value| value.as_str()),
             Some("xpc_bundled_service")

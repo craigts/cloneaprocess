@@ -5,7 +5,8 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::core::app_state::AppState;
-use crate::core::retention::{RetentionCleanupReport, run_retention_cleanup};
+use crate::core::retention::{run_retention_cleanup, RetentionCleanupReport};
+use crate::core::trace::normalize_raw_event;
 use crate::storage::{
     NewRawEvent, NewSession, RawEventRecord, RetentionPolicy, SessionRecord, WorkflowRunLogRecord,
     WorkflowRunRecord,
@@ -111,14 +112,21 @@ pub fn storage_smoke_test(state: State<'_, AppState>) -> Result<StorageSmokeResu
         })
         .map_err(|error| error.to_string())?;
 
+    let normalized_event = normalize_raw_event(
+        Some("storage_smoke_test"),
+        &serde_json::json!({ "ok": true }),
+        now_ms(),
+    )
+    .map_err(|error| error.to_string())?;
+
     let event_id = state
         .storage()
         .insert_raw_event(&NewRawEvent {
             session_id,
             sequence: 0,
-            event_type: "storage_smoke_test".to_string(),
-            event_json: r#"{"ok":true}"#.to_string(),
-            recorded_at_ms: now_ms(),
+            event_type: normalized_event.event_type,
+            event_json: normalized_event.event_json,
+            recorded_at_ms: normalized_event.recorded_at_ms,
         })
         .map_err(|error| error.to_string())?;
 
@@ -137,7 +145,10 @@ pub fn storage_smoke_test(state: State<'_, AppState>) -> Result<StorageSmokeResu
 }
 
 #[tauri::command]
-pub fn list_sessions(state: State<'_, AppState>, limit: Option<i64>) -> Result<Vec<SessionSummary>, String> {
+pub fn list_sessions(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<SessionSummary>, String> {
     let rows = state
         .storage()
         .list_sessions(limit.unwrap_or(20))
@@ -216,7 +227,9 @@ pub fn update_retention_policy(
 }
 
 #[tauri::command]
-pub fn run_retention_cleanup_now(state: State<'_, AppState>) -> Result<RetentionCleanupResponse, String> {
+pub fn run_retention_cleanup_now(
+    state: State<'_, AppState>,
+) -> Result<RetentionCleanupResponse, String> {
     run_retention_cleanup(state.storage(), state.recordings_root())
         .map(map_retention_cleanup_report)
         .map_err(|error| error.to_string())

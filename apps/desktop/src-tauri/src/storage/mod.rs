@@ -4,7 +4,8 @@ mod sqlite;
 
 pub use database::{
     NewKeyframe, NewRawEvent, NewSession, NewWorkflowRun, NewWorkflowRunLog, RawEventRecord,
-    RetentionPolicy, SessionRecord, Storage, StorageStatus, WorkflowRunLogRecord, WorkflowRunRecord,
+    RetentionPolicy, SessionRecord, Storage, StorageStatus, WorkflowRunLogRecord,
+    WorkflowRunRecord,
 };
 pub use error::StorageError;
 

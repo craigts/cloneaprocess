@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
 
-use crate::core::helper_paths::{NativeHelper, resolve_helper_binary};
+use crate::core::helper_paths::{resolve_helper_binary, NativeHelper};
 use crate::core::recorder::{RecorderCoordinator, RecorderTransportConfig};
 use crate::core::retention::run_retention_cleanup;
 use crate::storage::{Storage, StorageError};
@@ -28,7 +28,8 @@ impl AppState {
         fs::create_dir_all(&recordings_root)
             .map_err(|source| StorageError::io(recordings_root.clone(), source))?;
 
-        let storage = Storage::bootstrap(app_data_dir.join("storage").join("cloneaprocess.sqlite3"))?;
+        let storage =
+            Storage::bootstrap(app_data_dir.join("storage").join("cloneaprocess.sqlite3"))?;
         let _ = run_retention_cleanup(&storage, &recordings_root);
         let recorder_transport = resolve_recorder_transport(app);
         let runner_binary = resolve_helper_binary(app, NativeHelper::Runner);
@@ -39,7 +40,10 @@ impl AppState {
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0),
             recordings_root,
-            recorder: Mutex::new(RecorderCoordinator::new(storage.clone(), recorder_transport)),
+            recorder: Mutex::new(RecorderCoordinator::new(
+                storage.clone(),
+                recorder_transport,
+            )),
             storage,
             runner_binary,
         })
@@ -90,7 +94,10 @@ fn resolve_recorder_transport(app: &AppHandle) -> RecorderTransportConfig {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
         ),
-        _ => RecorderTransportConfig::subprocess_bridge(resolve_helper_binary(app, NativeHelper::Recorder)),
+        _ => RecorderTransportConfig::subprocess_bridge(resolve_helper_binary(
+            app,
+            NativeHelper::Recorder,
+        )),
     }
 }
 
@@ -106,5 +113,9 @@ fn bundled_recorder_service_exists() -> bool {
     };
 
     service_root.join("Contents").join("Info.plist").exists()
-        && service_root.join("Contents").join("MacOS").join("RecorderService").exists()
+        && service_root
+            .join("Contents")
+            .join("MacOS")
+            .join("RecorderService")
+            .exists()
 }
