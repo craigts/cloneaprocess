@@ -41,6 +41,24 @@ struct MockRunnerActionPerformer: RunnerActionPerforming {
         }
         return ["action": "selectMenu", "path": path]
     }
+
+    func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any] {
+        let kind = condition["kind"] as? String ?? "unknown"
+        recorder.record("waitFor:\(kind)")
+        if failOnKind == "waitFor" {
+            throw RunnerServiceError.executionFailed("waitFor failed")
+        }
+        return ["action": "waitFor", "conditionKind": kind, "timeoutMs": timeoutMs]
+    }
+
+    func assertCondition(condition: [String: Any]) throws -> [String: Any] {
+        let kind = condition["kind"] as? String ?? "unknown"
+        recorder.record("assert:\(kind)")
+        if failOnKind == "assert" {
+            throw RunnerServiceError.executionFailed("assert failed")
+        }
+        return ["action": "assert", "conditionKind": kind]
+    }
 }
 
 final class InvocationRecorder {
@@ -80,6 +98,18 @@ final class InvocationRecorder {
     #expect(lines[0].contains("\"ok\":true"))
     #expect(lines[1].contains("\"type\":\"run_started\""))
     #expect(lines[10].contains("\"type\":\"run_completed\""))
+}
+
+@Test func runWorkflowSupportsVerificationSteps() throws {
+    let recorder = InvocationRecorder()
+    let session = RunnerBridgeSession(performer: MockRunnerActionPerformer(failOnKind: nil, recorder: recorder))
+
+    let lines = session.handle(jsonLine: """
+    {"id":"req_verify","type":"run_workflow","payload":{"workflow_id":"wf_verify","run_id":"run_verify","steps":[{"kind":"waitFor","condition":{"kind":"elementPresent","selector":{"ax":{"role":"AXButton","title":"Save"}}},"timeoutMs":250},{"kind":"assert","condition":{"kind":"textEquals","selector":{"ax":{"role":"AXTextField","title":"Name"}},"value":"Alice"}}]}}
+    """)
+
+    #expect(recorder.invocations == ["waitFor:elementPresent", "assert:textEquals"])
+    #expect(lines.contains(where: { $0.contains("\"type\":\"run_completed\"") }))
 }
 
 @Test func runWorkflowFailureEmitsRunFailed() throws {

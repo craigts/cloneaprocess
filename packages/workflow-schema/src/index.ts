@@ -54,16 +54,21 @@ export type Condition =
   | { kind: 'elementPresent'; selector: Selector }
   | { kind: 'textEquals'; selector: Selector; value: string }
 
+export type VerificationHook = {
+  condition: Condition
+  timeoutMs?: number
+}
+
 export type ValueRef =
   | { kind: 'literal'; value: string }
   | { kind: 'variable'; name: string }
 
 export type Step =
-  | { kind: 'openApp'; app: string }
-  | { kind: 'focusWindow'; bundleId: string; title?: string }
-  | { kind: 'click'; selector: Selector }
-  | { kind: 'setText'; selector: Selector; value: ValueRef }
-  | { kind: 'selectMenu'; path: string[] }
+  | { kind: 'openApp'; app: string; verify?: VerificationHook[] }
+  | { kind: 'focusWindow'; bundleId: string; title?: string; verify?: VerificationHook[] }
+  | { kind: 'click'; selector: Selector; verify?: VerificationHook[] }
+  | { kind: 'setText'; selector: Selector; value: ValueRef; verify?: VerificationHook[] }
+  | { kind: 'selectMenu'; path: string[]; verify?: VerificationHook[] }
   | { kind: 'waitFor'; condition: Condition; timeoutMs: number }
   | { kind: 'assert'; condition: Condition }
 

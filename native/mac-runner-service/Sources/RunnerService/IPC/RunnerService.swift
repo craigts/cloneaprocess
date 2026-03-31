@@ -16,6 +16,7 @@ private let runnerProtocolCapabilities = [
     "focus_window",
     "set_text",
     "menu_navigation",
+    "verification_hooks",
     "subprocess_bridge",
 ]
 
@@ -24,6 +25,8 @@ protocol RunnerActionPerforming {
     func click(selector: [String: Any]) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
     func selectMenu(path: [String]) throws -> [String: Any]
+    func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any]
+    func assertCondition(condition: [String: Any]) throws -> [String: Any]
 }
 
 enum RunnerServiceError: Error {
@@ -195,6 +198,17 @@ final class RunnerBridgeSession {
                 throw RunnerServiceError.invalidRequest("selectMenu step requires a non-empty path")
             }
             return try performer.selectMenu(path: path)
+        case "waitFor":
+            guard let condition = step["condition"] as? [String: Any] else {
+                throw RunnerServiceError.invalidRequest("waitFor step requires condition")
+            }
+            let timeoutMs = (step["timeoutMs"] as? NSNumber)?.uint64Value ?? 1_500
+            return try performer.waitForCondition(condition: condition, timeoutMs: timeoutMs)
+        case "assert":
+            guard let condition = step["condition"] as? [String: Any] else {
+                throw RunnerServiceError.invalidRequest("assert step requires condition")
+            }
+            return try performer.assertCondition(condition: condition)
         default:
             throw RunnerServiceError.unsupportedStep("unsupported step kind \(kind)")
         }
@@ -350,6 +364,76 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         #endif
     }
 
+    func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any] {
+        let deadline = Date().timeIntervalSince1970 + (Double(timeoutMs) / 1000.0)
+        var lastFailure = "condition did not match"
+
+        repeat {
+            do {
+                var result = try assertCondition(condition: condition)
+                result["action"] = "waitFor"
+                result["timeoutMs"] = timeoutMs
+                return result
+            } catch let error as RunnerServiceError {
+                switch error {
+                case .executionFailed(let message):
+                    lastFailure = message
+                    Thread.sleep(forTimeInterval: 0.05)
+                case .invalidRequest, .unsupportedStep:
+                    throw error
+                }
+            }
+        } while Date().timeIntervalSince1970 < deadline
+
+        throw RunnerServiceError.executionFailed(
+            "timed out after \(timeoutMs)ms waiting for condition: \(lastFailure)"
+        )
+    }
+
+    func assertCondition(condition: [String: Any]) throws -> [String: Any] {
+        guard let kind = condition["kind"] as? String else {
+            throw RunnerServiceError.invalidRequest("condition kind is required")
+        }
+
+        switch kind {
+        case "elementPresent":
+            guard let selector = condition["selector"] as? [String: Any] else {
+                throw RunnerServiceError.invalidRequest("elementPresent condition requires selector")
+            }
+            let element = try resolveElement(selector: selector)
+            return [
+                "action": "assert",
+                "conditionKind": kind,
+                "matched": describeElement(element),
+            ]
+        case "textEquals":
+            guard let selector = condition["selector"] as? [String: Any] else {
+                throw RunnerServiceError.invalidRequest("textEquals condition requires selector")
+            }
+            guard let expectedValue = condition["value"] as? String else {
+                throw RunnerServiceError.invalidRequest("textEquals condition requires value")
+            }
+            let element = try resolveElement(selector: selector)
+            let actualValue = attributeString(kAXValueAttribute as CFString, element: element) ?? ""
+            guard actualValue == expectedValue else {
+                throw RunnerServiceError.executionFailed(
+                    "expected value '\(expectedValue)' but found '\(actualValue)'"
+                )
+            }
+            return [
+                "action": "assert",
+                "conditionKind": kind,
+                "expectedValue": expectedValue,
+                "actualValue": actualValue,
+                "matched": describeElement(element),
+            ]
+        case "windowVisible":
+            return try assertWindowVisible(condition: condition)
+        default:
+            throw RunnerServiceError.invalidRequest("unsupported condition kind \(kind)")
+        }
+    }
+
     private func resolveElement(selector: [String: Any]) throws -> AXUIElement {
         guard AXIsProcessTrusted() else {
             throw RunnerServiceError.executionFailed("Accessibility permission is required")
@@ -396,6 +480,43 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         }
 
         return nil
+    }
+
+    private func assertWindowVisible(condition: [String: Any]) throws -> [String: Any] {
+        #if canImport(AppKit)
+        guard let bundleId = condition["bundleId"] as? String, !bundleId.isEmpty else {
+            throw RunnerServiceError.invalidRequest("windowVisible condition requires bundleId")
+        }
+        guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+            throw RunnerServiceError.executionFailed("frontmost application is unavailable")
+        }
+        let frontmostBundleId = frontmost.bundleIdentifier ?? "unknown"
+        guard frontmostBundleId == bundleId else {
+            throw RunnerServiceError.executionFailed(
+                "expected frontmost app \(bundleId) but found \(frontmostBundleId)"
+            )
+        }
+
+        let expectedTitle = condition["title"] as? String
+        let actualTitle = try focusedWindowTitle(for: frontmost)
+        if let expectedTitle, actualTitle != expectedTitle {
+            throw RunnerServiceError.executionFailed(
+                "expected focused window title '\(expectedTitle)' but found '\(actualTitle ?? "")'"
+            )
+        }
+
+        var result: [String: Any] = [
+            "action": "assert",
+            "conditionKind": "windowVisible",
+            "bundleId": bundleId,
+        ]
+        if let actualTitle {
+            result["actualTitle"] = actualTitle
+        }
+        return result
+        #else
+        throw RunnerServiceError.executionFailed("window verification is only available on macOS")
+        #endif
     }
 
     private func findMatchingElement(
@@ -461,6 +582,41 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             return nil
         }
         return value
+    }
+
+    private func attributeString(_ attribute: CFString, element: AXUIElement) -> String? {
+        guard let value = copyAttribute(element: element, attribute: attribute) else {
+            return nil
+        }
+        if let string = value as? String, !string.isEmpty {
+            return string
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        return nil
+    }
+
+    private func focusedWindowTitle(for application: NSRunningApplication) throws -> String? {
+        let appElement = AXUIElementCreateApplication(application.processIdentifier)
+        guard let window = copyAttribute(element: appElement, attribute: kAXFocusedWindowAttribute as CFString) as! AXUIElement? else {
+            return nil
+        }
+        return titleValue(for: window)
+    }
+
+    private func describeElement(_ element: AXUIElement) -> [String: Any] {
+        var description: [String: Any] = [:]
+        if let role = attributeString(kAXRoleAttribute as CFString, element: element) {
+            description["role"] = role
+        }
+        if let title = titleValue(for: element) {
+            description["title"] = title
+        }
+        if let identifier = attributeString(kAXIdentifierAttribute as CFString, element: element) {
+            description["identifier"] = identifier
+        }
+        return description
     }
 }
 

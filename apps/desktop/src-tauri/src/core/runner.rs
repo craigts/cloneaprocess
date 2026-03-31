@@ -72,6 +72,7 @@ pub struct RunnerStepRequest {
     pub outer_run_id: String,
     pub step_index: usize,
     pub attempt: u32,
+    pub operation_label: String,
     pub step: Value,
 }
 
@@ -160,15 +161,15 @@ impl RunnerBridge {
 
     fn request_id(request: &RunnerStepRequest) -> String {
         format!(
-            "req_step_{}_attempt_{}",
-            request.step_index, request.attempt
+            "req_step_{}_attempt_{}_{}",
+            request.step_index, request.attempt, request.operation_label
         )
     }
 
     fn helper_run_id(request: &RunnerStepRequest) -> String {
         format!(
-            "{}_step_{}_attempt_{}",
-            request.outer_run_id, request.step_index, request.attempt
+            "{}_step_{}_attempt_{}_{}",
+            request.outer_run_id, request.step_index, request.attempt, request.operation_label
         )
     }
 
