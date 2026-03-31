@@ -96,10 +96,7 @@ pub fn compile_workflow(
                 }
             }
             "ax_snapshot" => {
-                let selector = payload
-                    .get("selector")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
+                let selector = build_ranked_selector(&payload).unwrap_or_else(|| json!({}));
                 if selector != json!({}) {
                     context.pending_snapshot = Some(SnapshotContext {
                         selector,
@@ -782,6 +779,225 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn build_ranked_selector(payload: &serde_json::Map<String, Value>) -> Option<Value> {
+    let existing_selector = payload
+        .get("selector")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let existing_ax = existing_selector
+        .get("ax")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let role = string_field(&existing_ax, payload, "role");
+    let subrole = string_field(&existing_ax, payload, "subrole");
+    let title = string_field(&existing_ax, payload, "title");
+    let description = string_field(&existing_ax, payload, "description");
+    let identifier = string_field(&existing_ax, payload, "identifier");
+    let path = existing_ax.get("path").cloned().filter(|value| {
+        value
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    });
+
+    let mut ranking = Vec::new();
+    if identifier.is_some() {
+        push_ax_candidate(
+            &mut ranking,
+            "identifier",
+            100,
+            "stable accessibility identifier",
+            base_ax_selector(&role, &subrole, [("identifier", identifier.clone())]),
+        );
+    }
+    if title.is_some() {
+        push_ax_candidate(
+            &mut ranking,
+            "title",
+            90,
+            "visible accessibility title",
+            base_ax_selector(&role, &subrole, [("title", title.clone())]),
+        );
+    }
+    if description != title {
+        if description.is_some() {
+            push_ax_candidate(
+                &mut ranking,
+                "description",
+                75,
+                "accessibility description fallback",
+                base_ax_selector(&role, &subrole, [("description", description.clone())]),
+            );
+        }
+    }
+    if path.is_some() {
+        push_ax_candidate(
+            &mut ranking,
+            "path",
+            60,
+            "structural accessibility path fallback",
+            base_ax_selector_with_path(&role, &subrole, path.clone()),
+        );
+    }
+    push_ax_candidate(
+        &mut ranking,
+        "role",
+        40,
+        "broad role fallback",
+        base_ax_selector(&role, &subrole, []),
+    );
+
+    let mut fallbacks = ranking.iter().skip(1).cloned().collect::<Vec<_>>();
+    if identifier.is_none() && title.is_none() {
+        if let Some(spatial) = pointer_fallback(payload, description.as_deref(), role.as_deref()) {
+            fallbacks.push(spatial);
+        }
+    }
+
+    let primary_ax = ranking
+        .iter()
+        .find_map(|candidate| candidate.get("ax").cloned())
+        .unwrap_or_else(|| json!({}));
+
+    let mut selector = serde_json::Map::new();
+    if let Some(target_app) = existing_selector.get("targetApp").cloned().or_else(|| {
+        payload
+            .get("bundleId")
+            .and_then(Value::as_str)
+            .map(|bundle_id| json!({ "bundleId": bundle_id }))
+    }) {
+        selector.insert("targetApp".to_string(), target_app);
+    }
+    if primary_ax != json!({}) {
+        selector.insert("ax".to_string(), primary_ax);
+    }
+    if let Some(strategy) = ranking
+        .first()
+        .and_then(|candidate| candidate.get("strategy"))
+        .and_then(Value::as_str)
+    {
+        selector.insert("preferredStrategy".to_string(), json!(strategy));
+    }
+    if !ranking.is_empty() {
+        selector.insert("ranking".to_string(), Value::Array(ranking));
+    }
+    if !fallbacks.is_empty() {
+        selector.insert("fallbacks".to_string(), Value::Array(fallbacks));
+    }
+
+    if selector.is_empty() {
+        None
+    } else {
+        Some(Value::Object(selector))
+    }
+}
+
+fn string_field(
+    selector_ax: &serde_json::Map<String, Value>,
+    payload: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<String> {
+    selector_ax
+        .get(field)
+        .and_then(Value::as_str)
+        .or_else(|| payload.get(field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn base_ax_selector<const N: usize>(
+    role: &Option<String>,
+    subrole: &Option<String>,
+    fields: [(&str, Option<String>); N],
+) -> Value {
+    let mut ax = serde_json::Map::new();
+    if let Some(role) = role {
+        ax.insert("role".to_string(), json!(role));
+    }
+    if let Some(subrole) = subrole {
+        ax.insert("subrole".to_string(), json!(subrole));
+    }
+    for (field, value) in fields {
+        if let Some(value) = value {
+            ax.insert(field.to_string(), json!(value));
+        }
+    }
+    Value::Object(ax)
+}
+
+fn base_ax_selector_with_path(
+    role: &Option<String>,
+    subrole: &Option<String>,
+    path: Option<Value>,
+) -> Value {
+    let mut value = base_ax_selector(role, subrole, []);
+    if let Some(ax) = value.as_object_mut() {
+        if let Some(path) = path {
+            ax.insert("path".to_string(), path);
+        }
+    }
+    value
+}
+
+fn push_ax_candidate(
+    ranking: &mut Vec<Value>,
+    strategy: &str,
+    score: u64,
+    reason: &str,
+    ax: Value,
+) {
+    if ax == json!({}) {
+        return;
+    }
+
+    let candidate = json!({
+        "kind": "ax",
+        "strategy": strategy,
+        "score": score,
+        "reason": reason,
+        "ax": ax,
+    });
+
+    if !ranking.iter().any(|existing| existing == &candidate) {
+        ranking.push(candidate);
+    }
+}
+
+fn pointer_fallback(
+    payload: &serde_json::Map<String, Value>,
+    anchor_text: Option<&str>,
+    role: Option<&str>,
+) -> Option<Value> {
+    let x = payload.get("x").and_then(Value::as_f64)?;
+    let y = payload.get("y").and_then(Value::as_f64)?;
+
+    let mut spatial = serde_json::Map::new();
+    if let Some(text) = anchor_text.or(role) {
+        spatial.insert("anchorText".to_string(), json!(text));
+    }
+    spatial.insert(
+        "rect".to_string(),
+        json!({
+            "x": x,
+            "y": y,
+            "w": 1,
+            "h": 1,
+        }),
+    );
+
+    Some(json!({
+        "kind": "spatial",
+        "strategy": "pointer",
+        "score": 20,
+        "reason": "original pointer position from recorder snapshot",
+        "spatial": spatial,
+    }))
+}
+
 fn push_wait_for_element(steps: &mut Vec<Value>, selector: &Value) {
     steps.push(json!({
         "kind": "waitFor",
@@ -1001,6 +1217,101 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0]["kind"], "waitFor");
         assert_eq!(steps[1]["kind"], "click");
+    }
+
+    #[test]
+    fn compiles_ranked_selector_candidates() {
+        let events = vec![
+            raw_event(
+                1,
+                0,
+                "ax_snapshot",
+                json!({
+                    "schemaVersion": 1,
+                    "payload": {
+                        "x": 320,
+                        "y": 180,
+                        "role": "AXButton",
+                        "subrole": "AXPushButton",
+                        "title": "Save",
+                        "description": "Save document",
+                        "identifier": "save-button",
+                        "selector": {
+                            "targetApp": { "bundleId": "com.apple.TextEdit" },
+                            "ax": {
+                                "role": "AXButton",
+                                "subrole": "AXPushButton",
+                                "title": "Save",
+                                "description": "Save document",
+                                "identifier": "save-button"
+                            }
+                        }
+                    }
+                }),
+            ),
+            raw_event(
+                2,
+                1,
+                "mouse_down",
+                json!({ "schemaVersion": 1, "payload": { "x": 320, "y": 180 } }),
+            ),
+        ];
+
+        let workflow = compile_workflow(12, "Selector ranking".to_string(), &events)
+            .expect("workflow should compile");
+        let selector = workflow.workflow["steps"][0]["condition"]["selector"].clone();
+
+        assert_eq!(selector["targetApp"]["bundleId"], "com.apple.TextEdit");
+        assert_eq!(selector["preferredStrategy"], "identifier");
+        assert_eq!(selector["ax"]["identifier"], "save-button");
+        assert_eq!(selector["ranking"][0]["strategy"], "identifier");
+        assert_eq!(selector["ranking"][1]["strategy"], "title");
+        assert_eq!(selector["fallbacks"][0]["strategy"], "title");
+        assert_eq!(selector["fallbacks"][1]["strategy"], "description");
+    }
+
+    #[test]
+    fn adds_pointer_fallback_for_weak_ax_surfaces() {
+        let events = vec![
+            raw_event(
+                1,
+                0,
+                "ax_snapshot",
+                json!({
+                    "schemaVersion": 1,
+                    "payload": {
+                        "x": 48,
+                        "y": 64,
+                        "role": "AXImage",
+                        "description": "Toolbar icon",
+                        "selector": {
+                            "targetApp": { "bundleId": "com.apple.Preview" },
+                            "ax": {
+                                "role": "AXImage",
+                                "description": "Toolbar icon"
+                            }
+                        }
+                    }
+                }),
+            ),
+            raw_event(
+                2,
+                1,
+                "mouse_down",
+                json!({ "schemaVersion": 1, "payload": { "x": 48, "y": 64 } }),
+            ),
+        ];
+
+        let workflow =
+            compile_workflow(13, "Weak AX".to_string(), &events).expect("workflow should compile");
+        let selector = workflow.workflow["steps"][0]["condition"]["selector"].clone();
+
+        assert_eq!(selector["preferredStrategy"], "description");
+        assert_eq!(selector["fallbacks"][0]["strategy"], "role");
+        assert_eq!(selector["fallbacks"][1]["kind"], "spatial");
+        assert_eq!(selector["fallbacks"][1]["spatial"]["anchorText"], "Toolbar icon");
+        assert_eq!(selector["fallbacks"][1]["spatial"]["rect"]["x"], 48.0);
+        assert_eq!(selector["fallbacks"][1]["spatial"]["rect"]["y"], 64.0);
     }
 
     #[test]

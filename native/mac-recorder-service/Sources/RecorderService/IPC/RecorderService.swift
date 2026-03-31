@@ -477,8 +477,9 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC, @unchecked Sendab
         let subrole = axStringAttribute(kAXSubroleAttribute as CFString, from: element)
         let title = preferredAXTitle(for: element)
         let description = axStringAttribute(kAXDescriptionAttribute as CFString, from: element)
+        let identifier = axStringAttribute(kAXIdentifierAttribute as CFString, from: element)
 
-        if role == nil && title == nil && description == nil {
+        if role == nil && title == nil && description == nil && identifier == nil {
             return nil
         }
 
@@ -507,6 +508,9 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC, @unchecked Sendab
         }
         if let description {
             selectorAX["description"] = description
+        }
+        if let identifier {
+            selectorAX["identifier"] = identifier
         }
 
         var selector: [String: Any] = [:]
@@ -537,6 +541,9 @@ final class RecorderServiceImpl: NSObject, RecorderServiceXPC, @unchecked Sendab
         }
         if let description {
             payload["description"] = description
+        }
+        if let identifier {
+            payload["identifier"] = identifier
         }
         if !selector.isEmpty {
             payload["selector"] = selector

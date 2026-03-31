@@ -4,26 +4,49 @@ export type VariableDef = {
   required?: boolean
 }
 
+export type SelectorAx = {
+  role?: string
+  subrole?: string
+  title?: string
+  description?: string
+  identifier?: string
+  valueHint?: string
+  path?: number[]
+}
+
+export type SelectorSpatial = {
+  anchorText?: string
+  relativeTo?: 'window' | 'parent'
+  rect?: { x: number; y: number; w: number; h: number }
+}
+
+export type SelectorCandidate =
+  | {
+      kind: 'ax'
+      strategy: 'identifier' | 'title' | 'description' | 'path' | 'role'
+      score: number
+      reason: string
+      ax: SelectorAx
+    }
+  | {
+      kind: 'spatial'
+      strategy: 'pointer'
+      score: number
+      reason: string
+      spatial: SelectorSpatial
+    }
+
 export type Selector = {
   targetApp?: { bundleId: string }
-  ax?: {
-    role?: string
-    subrole?: string
-    title?: string
-    description?: string
-    identifier?: string
-    valueHint?: string
-    path?: number[]
-  }
-  spatial?: {
-    anchorText?: string
-    relativeTo?: 'window' | 'parent'
-    rect?: { x: number; y: number; w: number; h: number }
-  }
+  ax?: SelectorAx
+  spatial?: SelectorSpatial
   visual?: {
     keyframeId?: string
     templateHash?: string
   }
+  preferredStrategy?: SelectorCandidate['strategy']
+  ranking?: SelectorCandidate[]
+  fallbacks?: SelectorCandidate[]
 }
 
 export type Condition =
@@ -50,4 +73,3 @@ export type Workflow = {
   inputs: VariableDef[]
   steps: Step[]
 }
-

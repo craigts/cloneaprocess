@@ -365,8 +365,7 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 
     private func resolveApplicationElement(selector: [String: Any]) throws -> AXUIElement {
         #if canImport(AppKit)
-        if let targetApp = selector["target_app"] as? [String: Any],
-           let bundleId = targetApp["bundle_id"] as? String,
+        if let bundleId = selectorTargetBundleId(selector),
            let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first
         {
             return AXUIElementCreateApplication(app.processIdentifier)
@@ -379,6 +378,24 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         #else
         throw RunnerServiceError.executionFailed("application lookup is only available on macOS")
         #endif
+    }
+
+    private func selectorTargetBundleId(_ selector: [String: Any]) -> String? {
+        if let targetApp = selector["target_app"] as? [String: Any],
+           let bundleId = targetApp["bundle_id"] as? String,
+           !bundleId.isEmpty
+        {
+            return bundleId
+        }
+
+        if let targetApp = selector["targetApp"] as? [String: Any],
+           let bundleId = targetApp["bundleId"] as? String,
+           !bundleId.isEmpty
+        {
+            return bundleId
+        }
+
+        return nil
     }
 
     private func findMatchingElement(
@@ -448,17 +465,60 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 }
 
 private struct SelectorCriteria {
+    let candidates: [AXSelectorCandidate]
+
+    init(selector: [String: Any]) {
+        var parsed: [AXSelectorCandidate] = []
+        if let ax = selector["ax"] as? [String: Any],
+           let candidate = AXSelectorCandidate(ax: ax)
+        {
+            parsed.append(candidate)
+        }
+
+        for key in ["ranking", "fallbacks"] {
+            guard let values = selector[key] as? [[String: Any]] else {
+                continue
+            }
+            for value in values {
+                guard (value["kind"] as? String) == "ax",
+                      let ax = value["ax"] as? [String: Any],
+                      let candidate = AXSelectorCandidate(ax: ax),
+                      !parsed.contains(candidate)
+                else {
+                    continue
+                }
+                parsed.append(candidate)
+            }
+        }
+
+        candidates = parsed
+    }
+
+    func matches(element: AXUIElement) -> Bool {
+        for candidate in candidates where candidate.matches(element: element) {
+            return true
+        }
+        return false
+    }
+}
+
+private struct AXSelectorCandidate: Equatable {
     let role: String?
     let subrole: String?
     let title: String?
     let description: String?
+    let identifier: String?
 
-    init(selector: [String: Any]) {
-        let ax = selector["ax"] as? [String: Any]
-        role = ax?["role"] as? String
-        subrole = ax?["subrole"] as? String
-        title = ax?["title"] as? String
-        description = ax?["description"] as? String
+    init?(ax: [String: Any]) {
+        role = ax["role"] as? String
+        subrole = ax["subrole"] as? String
+        title = ax["title"] as? String
+        description = ax["description"] as? String
+        identifier = ax["identifier"] as? String
+
+        if role == nil && subrole == nil && title == nil && description == nil && identifier == nil {
+            return nil
+        }
     }
 
     func matches(element: AXUIElement) -> Bool {
@@ -474,7 +534,10 @@ private struct SelectorCriteria {
         if let description, attributeString(kAXDescriptionAttribute as CFString, element) != description {
             return false
         }
-        return role != nil || subrole != nil || title != nil || description != nil
+        if let identifier, attributeString(kAXIdentifierAttribute as CFString, element) != identifier {
+            return false
+        }
+        return true
     }
 
     private func preferredTitle(for element: AXUIElement) -> String? {
