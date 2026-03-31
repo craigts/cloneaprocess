@@ -2,6 +2,8 @@
 
 This is the initial tracked issue list to start implementation. Status values are updated in place as work lands.
 
+_2026-03-31 automation sweep: all tracked issues through ISSUE-027 are `DONE`. No next issue is currently defined in this tracker._
+
 | ID | Title | Status | Description | Dependencies | Acceptance Criteria |
 | --- | --- | --- | --- | --- | --- |
 | ISSUE-001 | Repo scaffold and build scripts | DONE | Create directory layout and minimal Tauri app under `apps/desktop` plus package stubs under `packages/`. | None | Repo contains `apps/desktop`, `native/*`, and `packages/*` directories with the initial Tauri shell, shared packages, and native service stubs. |
