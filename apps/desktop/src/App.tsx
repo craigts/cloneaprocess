@@ -461,7 +461,7 @@ export function App() {
             ? status.helperHealth === 'protocol_mismatch'
               ? 'Rebuild or update the recorder helper so it matches the desktop app protocol contract.'
               : 'Run `npm run desktop:run` to rebuild the Swift recorder helper.'
-            : 'Switch back to the subprocess bridge or finish the direct XPC client implementation.',
+            : 'Run `npm run desktop:run` to bootstrap the recorder XPC service, or set `CLONEAPROCESS_RECORDER_TRANSPORT` to override the transport.',
       },
       {
         id: 'accessibility',

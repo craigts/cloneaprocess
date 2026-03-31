@@ -10,6 +10,9 @@ use crate::core::recorder::{RecorderCoordinator, RecorderTransportConfig};
 use crate::core::retention::run_retention_cleanup;
 use crate::storage::{Storage, StorageError};
 
+const BUNDLED_RECORDER_XPC_SERVICE_NAME: &str = "com.cloneaprocess.recorder";
+const DEV_RECORDER_XPC_SERVICE_NAME: &str = "com.cloneaprocess.recorder.dev";
+
 pub struct AppState {
     started_at_ms: u64,
     recordings_root: PathBuf,
@@ -71,34 +74,30 @@ impl AppState {
 }
 
 fn resolve_recorder_transport(app: &AppHandle) -> RecorderTransportConfig {
-    match std::env::var("CLONEAPROCESS_RECORDER_TRANSPORT")
+    let helper_binary = resolve_helper_binary(app, NativeHelper::Recorder);
+    let configured_transport = std::env::var("CLONEAPROCESS_RECORDER_TRANSPORT")
         .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some("xpc_bundle_service") => RecorderTransportConfig::xpc_bundle_service(
-            std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let configured_service_name = std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let configured_label = std::env::var("CLONEAPROCESS_RECORDER_XPC_LABEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    resolve_recorder_transport_from_config(
+        configured_transport.as_deref(),
+        configured_service_name.as_deref(),
+        bundled_recorder_service_exists(),
+        dev_recorder_launch_agent_exists(
+            configured_label.as_deref(),
+            configured_service_name.as_deref(),
         ),
-        Some("xpc") | Some("xpc_service") => RecorderTransportConfig::xpc_service(
-            std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
-        ),
-        _ if bundled_recorder_service_exists() => RecorderTransportConfig::xpc_bundle_service(
-            std::env::var("CLONEAPROCESS_RECORDER_XPC_SERVICE")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "com.cloneaprocess.recorder".to_string()),
-        ),
-        _ => RecorderTransportConfig::subprocess_bridge(resolve_helper_binary(
-            app,
-            NativeHelper::Recorder,
-        )),
-    }
+        helper_binary,
+    )
 }
 
 fn bundled_recorder_service_exists() -> bool {
@@ -118,4 +117,178 @@ fn bundled_recorder_service_exists() -> bool {
             .join("MacOS")
             .join("RecorderService")
             .exists()
+}
+
+fn dev_recorder_launch_agent_exists(
+    configured_label: Option<&str>,
+    configured_service_name: Option<&str>,
+) -> bool {
+    let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let label = configured_label
+        .filter(|value| !value.trim().is_empty())
+        .or(configured_service_name.filter(|value| !value.trim().is_empty()))
+        .unwrap_or(DEV_RECORDER_XPC_SERVICE_NAME);
+
+    home_dir
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", label))
+        .exists()
+}
+
+fn resolve_recorder_transport_from_config(
+    configured_transport: Option<&str>,
+    configured_service_name: Option<&str>,
+    bundled_service_exists: bool,
+    dev_launch_agent_exists: bool,
+    helper_binary: PathBuf,
+) -> RecorderTransportConfig {
+    match configured_transport.map(str::trim) {
+        Some("xpc_bundle_service") => RecorderTransportConfig::xpc_bundle_service(
+            configured_service_name
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(BUNDLED_RECORDER_XPC_SERVICE_NAME)
+                .to_string(),
+        ),
+        Some("xpc") | Some("xpc_service") => RecorderTransportConfig::xpc_service(
+            configured_service_name
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(DEV_RECORDER_XPC_SERVICE_NAME)
+                .to_string(),
+        ),
+        Some("subprocess_bridge") | Some("bridge") => {
+            RecorderTransportConfig::subprocess_bridge(helper_binary)
+        }
+        _ if bundled_service_exists => RecorderTransportConfig::xpc_bundle_service(
+            configured_service_name
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(BUNDLED_RECORDER_XPC_SERVICE_NAME)
+                .to_string(),
+        ),
+        _ if dev_launch_agent_exists => RecorderTransportConfig::xpc_service(
+            configured_service_name
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(DEV_RECORDER_XPC_SERVICE_NAME)
+                .to_string(),
+        ),
+        _ => RecorderTransportConfig::subprocess_bridge(helper_binary),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_recorder_transport_from_config, RecorderTransportConfig,
+        BUNDLED_RECORDER_XPC_SERVICE_NAME, DEV_RECORDER_XPC_SERVICE_NAME,
+    };
+    use std::path::PathBuf;
+
+    fn helper_binary() -> PathBuf {
+        PathBuf::from("/tmp/RecorderService")
+    }
+
+    #[test]
+    fn explicit_bundled_transport_wins() {
+        let transport = resolve_recorder_transport_from_config(
+            Some("xpc_bundle_service"),
+            None,
+            false,
+            false,
+            helper_binary(),
+        );
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::xpc_bundle_service(
+                BUNDLED_RECORDER_XPC_SERVICE_NAME.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_mach_transport_uses_dev_service_default() {
+        let transport = resolve_recorder_transport_from_config(
+            Some("xpc_service"),
+            None,
+            false,
+            false,
+            helper_binary(),
+        );
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::xpc_service(DEV_RECORDER_XPC_SERVICE_NAME.to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_subprocess_transport_can_override_xpc_defaults() {
+        let helper_binary = helper_binary();
+        let transport = resolve_recorder_transport_from_config(
+            Some("subprocess_bridge"),
+            None,
+            true,
+            true,
+            helper_binary.clone(),
+        );
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::subprocess_bridge(helper_binary)
+        );
+    }
+
+    #[test]
+    fn bundled_service_is_preferred_when_available() {
+        let transport =
+            resolve_recorder_transport_from_config(None, None, true, true, helper_binary());
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::xpc_bundle_service(
+                BUNDLED_RECORDER_XPC_SERVICE_NAME.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn bootstrapped_dev_launch_agent_prefers_mach_service() {
+        let transport =
+            resolve_recorder_transport_from_config(None, None, false, true, helper_binary());
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::xpc_service(DEV_RECORDER_XPC_SERVICE_NAME.to_string())
+        );
+    }
+
+    #[test]
+    fn subprocess_bridge_remains_fallback_without_xpc_endpoints() {
+        let helper_binary = helper_binary();
+        let transport =
+            resolve_recorder_transport_from_config(None, None, false, false, helper_binary.clone());
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::subprocess_bridge(helper_binary)
+        );
+    }
+
+    #[test]
+    fn configured_service_name_applies_to_dev_mach_selection() {
+        let transport = resolve_recorder_transport_from_config(
+            None,
+            Some("com.cloneaprocess.recorder.custom"),
+            false,
+            true,
+            helper_binary(),
+        );
+
+        assert_eq!(
+            transport,
+            RecorderTransportConfig::xpc_service("com.cloneaprocess.recorder.custom".to_string())
+        );
+    }
 }

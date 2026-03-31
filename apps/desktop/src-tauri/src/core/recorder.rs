@@ -92,7 +92,7 @@ pub enum RecorderTransportMode {
     XpcBundledService,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecorderTransportConfig {
     SubprocessBridge { binary_path: PathBuf },
     XpcMachService { service_name: String },
