@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke, isTauri } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 type BackendStatus = {
   appVersion: string
@@ -69,6 +70,17 @@ type PermissionCheck = { storageReady: boolean; recordingsRootReady: boolean; he
 type RetentionPolicy = { maxCompletedSessions: number; maxSessionAgeDays: number; orphanGraceHours: number }
 type ApprovalRequestPayload = { step_index?: number; category?: string; keyword?: string; summary?: string; detail?: string }
 
+type AgentProgressEvent =
+  | { type: 'screenshot'; stepNumber: number; base64: string; width: number; height: number }
+  | { type: 'thinking'; stepNumber: number }
+  | { type: 'action'; stepNumber: number; tool: string; description: string; params: Record<string, unknown> }
+  | { type: 'action_result'; stepNumber: number; success: boolean; error?: string }
+  | { type: 'completed'; stepNumber: number; summary: string; totalInputTokens: number; totalOutputTokens: number }
+  | { type: 'failed'; stepNumber: number; error: string }
+  | { type: 'cancelled'; stepNumber: number }
+
+type AgentStep = { tool: string; description: string; success: boolean; error?: string }
+
 const browserFallbackStatus: BackendStatus = {
   appVersion: 'browser-preview', platform: 'browser', recordingsRoot: './recordings', databasePath: './storage/cloneaprocess.sqlite3',
   startedAtMs: 0, sessionCount: 0, rawEventCount: 0, keyframeCount: 0, storageSchemaVersion: 1, workflowIrVersion: 1,
@@ -106,6 +118,16 @@ export function App() {
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [apiKeySaving, setApiKeySaving] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
+
+  // Agent state
+  const [agentRunning, setAgentRunning] = useState(false)
+  const [agentScreenshot, setAgentScreenshot] = useState<string | null>(null)
+  const [agentStatus, setAgentStatus] = useState('')
+  const [agentSteps, setAgentSteps] = useState<AgentStep[]>([])
+  const [agentStep, setAgentStep] = useState(0)
+  const [agentResult, setAgentResult] = useState<string | null>(null)
+  const [agentError, setAgentError] = useState<string | null>(null)
+  const agentListenerRef = useRef<UnlistenFn | null>(null)
 
   // --- data loading ---
 
@@ -360,6 +382,86 @@ export function App() {
     return workflowRuns.find((r) => r.sourceSessionId === selectedSessionId) ?? null
   }, [selectedSessionId, workflowRuns])
 
+  // --- agent ---
+
+  async function handleStartAgent() {
+    if (selectedSessionId == null) return
+    // Auto-save description
+    const trimmed = descriptionDraft.trim()
+    if (trimmed !== (selectedSession?.description ?? '')) {
+      await invoke('update_session_description', { sessionId: selectedSessionId, description: trimmed || null }).catch(() => {})
+    }
+
+    // Reset agent state
+    setAgentRunning(true)
+    setAgentScreenshot(null)
+    setAgentStatus('Starting agent...')
+    setAgentSteps([])
+    setAgentStep(0)
+    setAgentResult(null)
+    setAgentError(null)
+
+    // Listen for events
+    if (agentListenerRef.current) { agentListenerRef.current(); agentListenerRef.current = null }
+    agentListenerRef.current = await listen<AgentProgressEvent>('agent:progress', (event) => {
+      const e = event.payload
+      switch (e.type) {
+        case 'screenshot':
+          setAgentScreenshot(`data:image/jpeg;base64,${e.base64}`)
+          setAgentStep(e.stepNumber)
+          setAgentStatus(`Step ${e.stepNumber + 1}`)
+          break
+        case 'thinking':
+          setAgentStatus(`Step ${e.stepNumber + 1} — AI is thinking...`)
+          break
+        case 'action':
+          setAgentStatus(`Step ${e.stepNumber + 1} — ${e.description}`)
+          setAgentSteps((prev) => [...prev, { tool: e.tool, description: e.description, success: true }])
+          break
+        case 'action_result':
+          setAgentSteps((prev) => {
+            if (prev.length === 0) return prev
+            const updated = [...prev]
+            updated[updated.length - 1] = { ...updated[updated.length - 1], success: e.success, error: e.error }
+            return updated
+          })
+          break
+        case 'completed':
+          setAgentRunning(false)
+          setAgentStatus('Done')
+          setAgentResult(e.summary)
+          break
+        case 'failed':
+          setAgentRunning(false)
+          setAgentStatus('Failed')
+          setAgentError(e.error)
+          break
+        case 'cancelled':
+          setAgentRunning(false)
+          setAgentStatus('Cancelled')
+          break
+      }
+    })
+
+    // Start the agent
+    try {
+      await invoke('start_agent', { sessionId: selectedSessionId, maxSteps: 50 })
+    } catch (err) {
+      setAgentRunning(false)
+      setAgentError(String(err))
+      if (agentListenerRef.current) { agentListenerRef.current(); agentListenerRef.current = null }
+    }
+  }
+
+  async function handleStopAgent() {
+    try { await invoke('stop_agent') } catch {}
+  }
+
+  // Cleanup listener on unmount
+  useEffect(() => {
+    return () => { if (agentListenerRef.current) agentListenerRef.current() }
+  }, [])
+
   // ===================== RENDER =====================
 
   return (
@@ -462,18 +564,19 @@ export function App() {
       </section>
 
       {/* ---- STEP 3: AUTOMATE ---- */}
+      {/* ---- STEP 3: RUN AGENT ---- */}
       <section className="panel">
         <div className="step-header">
           <span className="step-number">3</span>
           <div>
-            <h2>Create and run your automation</h2>
-            <p className="step-subtitle">AI turns your recording into a reusable workflow.</p>
+            <h2>Run it</h2>
+            <p className="step-subtitle">AI watches the screen and performs each step live.</p>
           </div>
         </div>
 
         {!apiKeyDisplay ? (
           <div className="api-key-prompt">
-            <p>To use AI compilation, enter your Anthropic API key.</p>
+            <p>Enter your Anthropic API key to get started.</p>
             <div className="api-key-row">
               <input type="password" placeholder="sk-ant-..." value={apiKeyDraft} onChange={(e) => setApiKeyDraft(e.target.value)} />
               <button type="button" disabled={!apiKeyDraft.trim() || apiKeySaving} onClick={() => void handleSaveApiKey()}>
@@ -483,81 +586,42 @@ export function App() {
           </div>
         ) : (
           <div className="automate-actions">
-            <button type="button" className="primary-btn" disabled={selectedSessionId == null || aiCompiling} onClick={() => void handleAiCompile()}>
-              {aiCompiling ? 'AI is thinking...' : 'Build automation'}
-            </button>
-            {aiWorkflow ? (
-              <button type="button" className="primary-btn" disabled={executingWorkflow} onClick={() => void handleRunWorkflow()}>
-                {executingWorkflow ? 'Running...' : 'Run it'}
+            {!agentRunning ? (
+              <button type="button" className="primary-btn" disabled={selectedSessionId == null} onClick={() => void handleStartAgent()}>
+                Run agent
               </button>
-            ) : null}
+            ) : (
+              <button type="button" className="stop-btn" onClick={() => void handleStopAgent()}>
+                Stop agent
+              </button>
+            )}
           </div>
         )}
 
-        {aiCompiling ? <p className="loading">Analyzing your recording and building steps...</p> : null}
-        {aiRefining ? <p className="loading">AI is analyzing the failure and fixing the workflow...</p> : null}
-        {aiMessage ? <p className="ai-message">{aiMessage}</p> : null}
+        {agentStatus ? <p className="agent-status">{agentStatus}</p> : null}
 
-        {aiWorkflow ? (
-          <div className="workflow-result">
-            <div className="workflow-result__header">
-              <span className="status-pill">{aiWorkflow.stepCount} steps</span>
-              {latestRun ? (
-                <span className={`status-pill ${latestRun.status === 'completed' ? 'status-pill--success' : latestRun.status === 'failed' ? 'status-pill--warning' : ''}`}>
-                  {latestRun.status === 'completed' ? 'Last run succeeded' : latestRun.status === 'failed' ? `Failed at step ${(latestRun.failedStepIndex ?? 0) + 1}` : latestRun.status}
-                </span>
-              ) : null}
-            </div>
-            <div className="workflow-steps">
-              {(() => {
-                try {
-                  const wf = JSON.parse(aiWorkflow.workflowJson)
-                  return (wf.steps ?? []).map((step: { kind: string; description?: string }, i: number) => (
-                    <div key={i} className="workflow-step-card">
-                      <span className="workflow-step-card__num">{i + 1}</span>
-                      <span>{step.description || step.kind}</span>
-                    </div>
-                  ))
-                } catch { return <pre className="code-block">{aiWorkflow.workflowJson}</pre> }
-              })()}
-            </div>
+        {/* Live screenshot */}
+        {agentScreenshot ? (
+          <div className="agent-screenshot">
+            <img src={agentScreenshot} alt="Current screen" />
           </div>
         ) : null}
 
-        {latestRun && latestRun.status === 'failed' ? (
-          <div className="fix-section">
-            <textarea
-              className="fix-hint"
-              rows={2}
-              placeholder="What went wrong? (e.g., 'Open links is inside View more cell actions submenu')"
-              value={fixHint}
-              onChange={(e) => setFixHint(e.target.value)}
-            />
-            <div className="failure-actions">
-              <button type="button" className="primary-btn" disabled={aiRefining || !aiWorkflow} onClick={() => void handleAiRefine()}>
-                {aiRefining ? 'AI is fixing...' : 'Fix with AI'}
-              </button>
-              <button type="button" className="copy-logs-btn" onClick={() => void handleCopyLogs()}>
-                Copy logs
-              </button>
-            </div>
+        {/* Agent steps */}
+        {agentSteps.length > 0 ? (
+          <div className="workflow-steps">
+            {agentSteps.map((step, i) => (
+              <div key={i} className={`workflow-step-card ${step.success ? '' : 'workflow-step-card--failed'}`}>
+                <span className="workflow-step-card__num">{i + 1}</span>
+                <span>{step.description}</span>
+                {step.error ? <span className="step-error">{step.error}</span> : null}
+              </div>
+            ))}
           </div>
         ) : null}
 
-        {aiError ? <p className="note">{aiError}</p> : null}
-        {workflowActionError ? <p className="note">{workflowActionError}</p> : null}
-
-        {/* Approval gate */}
-        {pendingApproval ? (
-          <article className="approval-card">
-            <strong>Approval needed</strong>
-            <p>{pendingApproval.summary ?? 'A step needs your approval before continuing.'}</p>
-            <div className="automate-actions">
-              <button type="button" disabled={approvalActionPending} onClick={() => void handleApproval('approve_workflow_run')}>Approve</button>
-              <button type="button" className="wizard-skip" disabled={approvalActionPending} onClick={() => void handleApproval('reject_workflow_run')}>Reject</button>
-            </div>
-          </article>
-        ) : null}
+        {agentResult ? <p className="ai-message">{agentResult}</p> : null}
+        {agentError ? <p className="note">{agentError}</p> : null}
       </section>
 
       {/* ---- ADVANCED (collapsed by default) ---- */}

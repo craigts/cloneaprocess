@@ -5,6 +5,12 @@ import ApplicationServices
 #if canImport(AppKit)
 import AppKit
 #endif
+#if canImport(ImageIO)
+import ImageIO
+#endif
+#if canImport(UniformTypeIdentifiers)
+import UniformTypeIdentifiers
+#endif
 
 private let runnerProtocolVersion = 1
 private let runnerProtocolMinimumVersion = 1
@@ -18,6 +24,7 @@ private let runnerProtocolCapabilities = [
     "menu_navigation",
     "verification_hooks",
     "key_press",
+    "screenshot",
     "subprocess_bridge",
 ]
 
@@ -32,6 +39,7 @@ protocol RunnerActionPerforming {
     func selectMenu(path: [String]) throws -> [String: Any]
     func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any]
     func assertCondition(condition: [String: Any]) throws -> [String: Any]
+    func takeScreenshot(quality: Double) throws -> [String: Any]
 }
 
 enum RunnerServiceError: Error {
@@ -88,6 +96,10 @@ final class RunnerBridgeSession {
                 ]
             case "run_workflow":
                 return try handleRunWorkflow(requestId: requestId, payload: payload)
+            case "take_screenshot":
+                let quality = (payload["quality"] as? NSNumber)?.doubleValue ?? 0.6
+                let result = try performer.takeScreenshot(quality: quality)
+                return [serializeReply(id: requestId, ok: true, payload: result)]
             case "abort_run":
                 return [
                     serializeReply(
@@ -779,6 +791,38 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             description["identifier"] = identifier
         }
         return description
+    }
+
+    func takeScreenshot(quality: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices) && canImport(ImageIO) && canImport(UniformTypeIdentifiers)
+        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else {
+            throw RunnerServiceError.executionFailed("failed to capture screenshot")
+        }
+
+        let data = NSMutableData()
+        let jpegType = UTType.jpeg.identifier as CFString
+        guard let destination = CGImageDestinationCreateWithData(data, jpegType, 1, nil) else {
+            throw RunnerServiceError.executionFailed("failed to create JPEG destination")
+        }
+
+        let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw RunnerServiceError.executionFailed("failed to finalize JPEG encoding")
+        }
+
+        let base64 = (data as Data).base64EncodedString()
+
+        return [
+            "action": "screenshot",
+            "base64": base64,
+            "width": image.width,
+            "height": image.height,
+            "format": "jpeg",
+        ]
+        #else
+        throw RunnerServiceError.executionFailed("screenshot is only available on macOS")
+        #endif
     }
 }
 

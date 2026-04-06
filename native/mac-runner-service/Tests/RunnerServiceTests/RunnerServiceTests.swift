@@ -75,6 +75,11 @@ struct MockRunnerActionPerformer: RunnerActionPerforming {
         return ["action": "selectMenu", "path": path]
     }
 
+    func takeScreenshot(quality: Double) throws -> [String: Any] {
+        recorder.record("screenshot")
+        return ["action": "screenshot", "base64": "fakeb64data", "width": 1440, "height": 900, "format": "jpeg"]
+    }
+
     func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any] {
         let kind = condition["kind"] as? String ?? "unknown"
         recorder.record("waitFor:\(kind)")

@@ -19,9 +19,12 @@ pub fn run() {
         .setup(|app| {
             let state = AppState::bootstrap(&app.handle())?;
             app.manage(state);
+            app.manage(commands::agent::AgentState::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::agent::start_agent,
+            commands::agent::stop_agent,
             commands::ai::ai_compile_workflow,
             commands::ai::ai_refine_workflow,
             commands::ai::get_ai_api_key,

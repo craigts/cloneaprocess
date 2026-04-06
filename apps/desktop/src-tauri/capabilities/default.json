@@ -7,6 +7,8 @@
     "core:event:default",
     "core:window:default",
     "core:app:default",
+    "allow-start-agent",
+    "allow-stop-agent",
     "allow-ai-compile-workflow",
     "allow-ai-refine-workflow",
     "allow-get-ai-api-key",
