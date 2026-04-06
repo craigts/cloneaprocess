@@ -35,12 +35,14 @@ pub fn ai_refine_workflow(
     state: State<'_, AppState>,
     workflow_json: String,
     workflow_run_id: i64,
+    source_session_id: Option<i64>,
     session_description: Option<String>,
 ) -> Result<AiCompileResponse, String> {
     let result = ai_compiler::ai_refine_workflow(
         state.storage(),
         &workflow_json,
         workflow_run_id,
+        source_session_id,
         session_description.as_deref(),
     )?;
 

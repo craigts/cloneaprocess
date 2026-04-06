@@ -249,6 +249,7 @@ export function App() {
       const result = await invoke<AiCompileResponse>('ai_refine_workflow', {
         workflowJson: aiWorkflow.workflowJson,
         workflowRunId: latestRun.id,
+        sourceSessionId: selectedSessionId,
         sessionDescription: selectedSession?.description ?? null,
       })
       setAiWorkflow(result)

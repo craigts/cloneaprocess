@@ -282,6 +282,7 @@ pub fn ai_refine_workflow(
     storage: &Storage,
     workflow_json: &str,
     run_id: i64,
+    source_session_id: Option<i64>,
     session_description: Option<&str>,
 ) -> Result<AiCompileResult, String> {
     let api_key = resolve_api_key(storage)?;
@@ -303,22 +304,43 @@ pub fn ai_refine_workflow(
         })
         .collect();
 
+    // Load original recording context if we have a source session
+    let (ax_snapshots_json, keyframes) = if let Some(sid) = source_session_id {
+        let events = storage
+            .list_raw_events_for_session(sid, MAX_EVENTS_IN_PROMPT as i64)
+            .unwrap_or_default();
+
+        let snapshots: Vec<Value> = events.iter()
+            .filter(|e| e.event_type == "ax_snapshot")
+            .take(MAX_AX_SNAPSHOTS_IN_PROMPT)
+            .filter_map(|e| serde_json::from_str::<Value>(&e.event_json).ok())
+            .filter_map(|env| env.get("payload").cloned())
+            .collect();
+
+        let kf = load_keyframe_images(&events);
+        (serde_json::to_string_pretty(&snapshots).unwrap_or_default(), kf)
+    } else {
+        ("[]".to_string(), Vec::new())
+    };
+
     let prompt = build_refinement_prompt(
         workflow_json,
         &logs_text.join("\n\n"),
         session_description.unwrap_or("(no description)"),
+        &ax_snapshots_json,
     );
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| format!("failed to create async runtime: {e}"))?;
 
-    runtime.block_on(call_claude_api(&api_key, &prompt, &[]))
+    runtime.block_on(call_claude_api(&api_key, &prompt, &keyframes))
 }
 
 fn build_refinement_prompt(
     workflow_json: &str,
     run_logs: &str,
     description: &str,
+    ax_snapshots_json: &str,
 ) -> String {
     format!(
         r#"You are an expert at debugging and fixing macOS automation workflows.
@@ -326,6 +348,12 @@ fn build_refinement_prompt(
 ## User's description of what they want to automate
 
 {description}
+
+## AX snapshots from the original recording
+
+These are the accessibility elements captured during the user's recording. Use them to understand the UI structure, including menu items, submenus, and element hierarchy:
+
+{ax_snapshots_json}
 
 ## The workflow that failed
 
@@ -339,7 +367,7 @@ fn build_refinement_prompt(
 
 ## Your task
 
-The workflow above was executed and failed. Analyze the run logs to understand what went wrong, then produce a FIXED version of the workflow.
+The workflow above was executed and failed. Analyze the run logs AND the original AX snapshots to understand what went wrong, then produce a FIXED version of the workflow.
 
 Common fixes:
 - If a selector didn't match, try a different AX role (e.g., `AXMenuItem` instead of `AXStaticText` for context menu items)
