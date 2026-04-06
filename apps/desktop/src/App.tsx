@@ -98,6 +98,7 @@ export function App() {
   const [descriptionSaving, setDescriptionSaving] = useState(false)
   const [aiWorkflow, setAiWorkflow] = useState<AiCompileResponse | null>(null)
   const [aiCompiling, setAiCompiling] = useState(false)
+  const [aiRefining, setAiRefining] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
   const [apiKeyDisplay, setApiKeyDisplay] = useState('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
@@ -237,6 +238,20 @@ export function App() {
       setAiWorkflow(await invoke<AiCompileResponse>('ai_compile_workflow', { sessionId: selectedSessionId }))
     } catch (err) { setAiError(String(err)) }
     finally { setAiCompiling(false) }
+  }
+
+  async function handleAiRefine() {
+    if (!aiWorkflow || !latestRun) return
+    setAiRefining(true); setAiError(null)
+    try {
+      const result = await invoke<AiCompileResponse>('ai_refine_workflow', {
+        workflowJson: aiWorkflow.workflowJson,
+        workflowRunId: latestRun.id,
+        sessionDescription: selectedSession?.description ?? null,
+      })
+      setAiWorkflow(result)
+    } catch (err) { setAiError(String(err)) }
+    finally { setAiRefining(false) }
   }
 
   async function handleRunWorkflow() {
@@ -494,9 +509,14 @@ export function App() {
         ) : null}
 
         {latestRun && latestRun.status === 'failed' ? (
-          <button type="button" className="copy-logs-btn" onClick={() => void handleCopyLogs()}>
-            Copy failure logs to clipboard
-          </button>
+          <div className="failure-actions">
+            <button type="button" className="primary-btn" disabled={aiRefining || !aiWorkflow} onClick={() => void handleAiRefine()}>
+              {aiRefining ? 'AI is fixing...' : 'Fix with AI'}
+            </button>
+            <button type="button" className="copy-logs-btn" onClick={() => void handleCopyLogs()}>
+              Copy logs
+            </button>
+          </div>
         ) : null}
 
         {aiError ? <p className="note">{aiError}</p> : null}

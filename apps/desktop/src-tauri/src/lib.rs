@@ -23,6 +23,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ai::ai_compile_workflow,
+            commands::ai::ai_refine_workflow,
             commands::ai::get_ai_api_key,
             commands::ai::set_ai_api_key,
             commands::clipboard::copy_to_clipboard,

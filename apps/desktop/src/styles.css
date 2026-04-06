@@ -221,6 +221,13 @@ button, input, textarea, select { font: inherit; }
 
 .primary-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.failure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
 .copy-logs-btn {
   margin-top: 0.75rem;
   padding: 0.55rem 1rem;

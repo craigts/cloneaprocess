@@ -31,6 +31,29 @@ pub fn ai_compile_workflow(
 }
 
 #[tauri::command]
+pub fn ai_refine_workflow(
+    state: State<'_, AppState>,
+    workflow_json: String,
+    workflow_run_id: i64,
+    session_description: Option<String>,
+) -> Result<AiCompileResponse, String> {
+    let result = ai_compiler::ai_refine_workflow(
+        state.storage(),
+        &workflow_json,
+        workflow_run_id,
+        session_description.as_deref(),
+    )?;
+
+    Ok(AiCompileResponse {
+        workflow_json: result.workflow_json,
+        step_count: result.step_count,
+        model: result.model,
+        prompt_tokens: result.prompt_tokens,
+        output_tokens: result.output_tokens,
+    })
+}
+
+#[tauri::command]
 pub fn get_ai_api_key(state: State<'_, AppState>) -> Result<String, String> {
     let from_settings = state
         .storage()

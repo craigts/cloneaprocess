@@ -8,6 +8,7 @@
     "core:window:default",
     "core:app:default",
     "allow-ai-compile-workflow",
+    "allow-ai-refine-workflow",
     "allow-get-ai-api-key",
     "allow-set-ai-api-key",
     "allow-copy-to-clipboard",

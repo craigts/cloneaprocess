@@ -188,6 +188,92 @@ Return ONLY the JSON object."#,
     )
 }
 
+pub fn ai_refine_workflow(
+    storage: &Storage,
+    workflow_json: &str,
+    run_id: i64,
+    session_description: Option<&str>,
+) -> Result<AiCompileResult, String> {
+    let api_key = resolve_api_key(storage)?;
+
+    let run_logs = storage
+        .list_workflow_run_logs(run_id, 100)
+        .map_err(|e| e.to_string())?;
+
+    let logs_text: Vec<String> = run_logs
+        .iter()
+        .map(|log| {
+            let payload: Value = serde_json::from_str(&log.payload_json).unwrap_or(json!({}));
+            format!(
+                "{}{} — {}",
+                log.event_type,
+                log.step_index.map(|i| format!(" (step {})", i)).unwrap_or_default(),
+                serde_json::to_string_pretty(&payload).unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    let prompt = build_refinement_prompt(
+        workflow_json,
+        &logs_text.join("\n\n"),
+        session_description.unwrap_or("(no description)"),
+    );
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("failed to create async runtime: {e}"))?;
+
+    runtime.block_on(call_claude_api(&api_key, &prompt))
+}
+
+fn build_refinement_prompt(
+    workflow_json: &str,
+    run_logs: &str,
+    description: &str,
+) -> String {
+    format!(
+        r#"You are an expert at debugging and fixing macOS automation workflows.
+
+## User's description of what they want to automate
+
+{description}
+
+## The workflow that failed
+
+```json
+{workflow_json}
+```
+
+## Run logs showing what happened
+
+{run_logs}
+
+## Your task
+
+The workflow above was executed and failed. Analyze the run logs to understand what went wrong, then produce a FIXED version of the workflow.
+
+Common fixes:
+- If a selector didn't match, try a different AX role (e.g., `AXMenuItem` instead of `AXStaticText` for context menu items)
+- If a step timed out, add a `delay` before it to let the UI settle
+- If a click didn't have the intended effect, try using `keyPress` with a keyboard shortcut instead
+- If a right-click context menu item wasn't found, the menu may use `AXMenuItem` role, not `AXStaticText`
+- If steps happened too fast, add `delay` steps between them
+
+Available step kinds: `focusWindow`, `click`, `rightClick`, `setText`, `waitFor`, `keyPress`, `delay`
+- `keyPress` example: `{{"kind":"keyPress","key":"n","modifiers":["cmd"]}}`
+- `delay` example: `{{"kind":"delay","ms":1000}}`
+- `setText` value must be: `{{"kind":"literal","value":"text"}}`
+- Keys: a-z, 0-9, return, tab, space, delete, escape, left, right, up, down
+- Modifiers: cmd, shift, alt, ctrl
+
+IMPORTANT: Do NOT use selectors targeting `com.apple.dock`, `com.apple.dock.helper`, or `AXDockItem` — these always fail. Use `focusWindow` instead.
+
+Return ONLY the fixed JSON workflow object, no explanation."#,
+        description = description,
+        workflow_json = workflow_json,
+        run_logs = run_logs,
+    )
+}
+
 #[derive(Deserialize)]
 struct ClaudeResponse {
     content: Vec<ContentBlock>,
