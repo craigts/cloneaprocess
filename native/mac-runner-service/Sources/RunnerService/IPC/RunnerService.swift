@@ -25,6 +25,7 @@ protocol RunnerActionPerforming {
     func focusWindow(bundleId: String, title: String?) throws -> [String: Any]
     func click(selector: [String: Any]) throws -> [String: Any]
     func rightClick(selector: [String: Any]) throws -> [String: Any]
+    func clickAt(x: Double, y: Double, button: String) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
     func setTextFocused(value: String) throws -> [String: Any]
     func keyPress(key: String, modifiers: [String]) throws -> [String: Any]
@@ -213,6 +214,18 @@ final class RunnerBridgeSession {
                 throw RunnerServiceError.invalidRequest("rightClick step requires selector")
             }
             return try performer.rightClick(selector: selector)
+        case "clickAt":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("clickAt step requires x and y coordinates")
+            }
+            return try performer.clickAt(x: x, y: y, button: "left")
+        case "rightClickAt":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("rightClickAt step requires x and y coordinates")
+            }
+            return try performer.clickAt(x: x, y: y, button: "right")
         case "keyPress":
             guard let key = step["key"] as? String, !key.isEmpty else {
                 throw RunnerServiceError.invalidRequest("keyPress step requires key")
@@ -390,6 +403,34 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             throw RunnerServiceError.executionFailed("set value failed with code \(result.rawValue)")
         }
         return ["action": "setText", "value": value]
+    }
+
+    func clickAt(x: Double, y: Double, button: String) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        let point = CGPoint(x: x, y: y)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+
+        let mouseButton: CGMouseButton = button == "right" ? .right : .left
+        let downType: CGEventType = button == "right" ? .rightMouseDown : .leftMouseDown
+        let upType: CGEventType = button == "right" ? .rightMouseUp : .leftMouseUp
+
+        guard let mouseDown = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton) else {
+            throw RunnerServiceError.executionFailed("failed to create mouse down event")
+        }
+        guard let mouseUp = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton) else {
+            throw RunnerServiceError.executionFailed("failed to create mouse up event")
+        }
+
+        mouseDown.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.05)
+        mouseUp.post(tap: .cghidEventTap)
+
+        return ["action": "clickAt", "x": x, "y": y, "button": button]
+        #else
+        throw RunnerServiceError.executionFailed("clickAt is only available on macOS")
+        #endif
     }
 
     func setTextFocused(value: String) throws -> [String: Any] {

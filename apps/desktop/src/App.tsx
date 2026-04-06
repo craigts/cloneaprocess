@@ -100,6 +100,7 @@ export function App() {
   const [aiCompiling, setAiCompiling] = useState(false)
   const [aiRefining, setAiRefining] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
+  const [aiMessage, setAiMessage] = useState<string | null>(null)
   const [apiKeyDisplay, setApiKeyDisplay] = useState('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [apiKeySaving, setApiKeySaving] = useState(false)
@@ -160,7 +161,7 @@ export function App() {
 
   useEffect(() => {
     setDescriptionDraft(selectedSession?.description ?? '')
-    setAiWorkflow(null); setAiError(null)
+    setAiWorkflow(null); setAiError(null); setAiMessage(null)
   }, [selectedSession?.id])
 
   const selectedWorkflowRun = useMemo(() => workflowRuns.find((r) => r.id === selectedWorkflowRunId) ?? null, [selectedWorkflowRunId, workflowRuns])
@@ -233,7 +234,7 @@ export function App() {
 
   async function handleAiCompile() {
     if (selectedSessionId == null) return
-    setAiCompiling(true); setAiError(null); setAiWorkflow(null)
+    setAiCompiling(true); setAiError(null); setAiMessage(null); setAiWorkflow(null)
     try {
       setAiWorkflow(await invoke<AiCompileResponse>('ai_compile_workflow', { sessionId: selectedSessionId }))
     } catch (err) { setAiError(String(err)) }
@@ -242,7 +243,8 @@ export function App() {
 
   async function handleAiRefine() {
     if (!aiWorkflow || !latestRun) return
-    setAiRefining(true); setAiError(null)
+    const oldStepCount = aiWorkflow.stepCount
+    setAiRefining(true); setAiError(null); setAiMessage(null)
     try {
       const result = await invoke<AiCompileResponse>('ai_refine_workflow', {
         workflowJson: aiWorkflow.workflowJson,
@@ -250,6 +252,10 @@ export function App() {
         sessionDescription: selectedSession?.description ?? null,
       })
       setAiWorkflow(result)
+      const changed = result.workflowJson !== aiWorkflow.workflowJson
+      setAiMessage(changed
+        ? `AI updated the workflow (${oldStepCount} → ${result.stepCount} steps). Hit "Run it" to try the fix.`
+        : 'AI returned the same workflow — it may not know how to fix this. Try editing your description with more detail.')
     } catch (err) { setAiError(String(err)) }
     finally { setAiRefining(false) }
   }
@@ -481,6 +487,8 @@ export function App() {
         )}
 
         {aiCompiling ? <p className="loading">Analyzing your recording and building steps...</p> : null}
+        {aiRefining ? <p className="loading">AI is analyzing the failure and fixing the workflow...</p> : null}
+        {aiMessage ? <p className="ai-message">{aiMessage}</p> : null}
 
         {aiWorkflow ? (
           <div className="workflow-result">

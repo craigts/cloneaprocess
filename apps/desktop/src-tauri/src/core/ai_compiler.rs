@@ -9,6 +9,7 @@ const ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const MAX_EVENTS_IN_PROMPT: usize = 150;
 const MAX_AX_SNAPSHOTS_IN_PROMPT: usize = 40;
+const MAX_KEYFRAMES_IN_PROMPT: usize = 8;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,11 +41,98 @@ pub fn ai_compile_workflow(
     )?;
 
     let prompt = build_prompt(&session, &events, &v1_draft);
+    let keyframes = load_keyframe_images(&events);
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| format!("failed to create async runtime: {e}"))?;
 
-    runtime.block_on(call_claude_api(&api_key, &prompt))
+    runtime.block_on(call_claude_api(&api_key, &prompt, &keyframes))
+}
+
+fn load_keyframe_images(events: &[RawEventRecord]) -> Vec<(String, String)> {
+    use std::fs;
+
+    let mut images = Vec::new();
+    for event in events {
+        if event.event_type != "screen_frame" { continue; }
+        if images.len() >= MAX_KEYFRAMES_IN_PROMPT { break; }
+
+        let envelope: Value = match serde_json::from_str(&event.event_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = match envelope.get("payload").and_then(|p| p.get("path")).and_then(Value::as_str) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if let Ok(bytes) = fs::read(path) {
+            use std::io::Write;
+            let mut b64 = Vec::new();
+            {
+                let mut encoder = Base64Encoder::new(&mut b64);
+                let _ = encoder.write_all(&bytes);
+                let _ = encoder.finish();
+            }
+            if let Ok(b64_str) = String::from_utf8(b64) {
+                let caption = format!("Keyframe at event seq {} ({}ms)", event.sequence, event.recorded_at_ms);
+                images.push((b64_str, caption));
+            }
+        }
+    }
+    images
+}
+
+struct Base64Encoder<W: std::io::Write> {
+    writer: W,
+    buf: [u8; 3],
+    buf_len: usize,
+}
+
+const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+impl<W: std::io::Write> Base64Encoder<W> {
+    fn new(writer: W) -> Self { Self { writer, buf: [0; 3], buf_len: 0 } }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if self.buf_len > 0 {
+            let mut block = [0u8; 3];
+            block[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+            let mut out = [b'='; 4];
+            out[0] = B64_CHARS[(block[0] >> 2) as usize];
+            out[1] = B64_CHARS[((block[0] & 0x03) << 4 | block[1] >> 4) as usize];
+            if self.buf_len > 1 {
+                out[2] = B64_CHARS[((block[1] & 0x0f) << 2 | block[2] >> 6) as usize];
+            }
+            self.writer.write_all(&out)?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Base64Encoder<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut consumed = 0;
+        for &byte in data {
+            self.buf[self.buf_len] = byte;
+            self.buf_len += 1;
+            consumed += 1;
+            if self.buf_len == 3 {
+                let b = self.buf;
+                let out = [
+                    B64_CHARS[(b[0] >> 2) as usize],
+                    B64_CHARS[((b[0] & 0x03) << 4 | b[1] >> 4) as usize],
+                    B64_CHARS[((b[1] & 0x0f) << 2 | b[2] >> 6) as usize],
+                    B64_CHARS[(b[2] & 0x3f) as usize],
+                ];
+                self.writer.write_all(&out)?;
+                self.buf_len = 0;
+            }
+        }
+        Ok(consumed)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { self.writer.flush() }
 }
 
 fn resolve_api_key(storage: &Storage) -> Result<String, String> {
@@ -141,7 +229,9 @@ Important platform behaviors to account for:
   - Available keys: a-z, 0-9, return, tab, space, delete, escape, left, right, up, down, f1-f5
   - Available modifiers: cmd, shift, alt, ctrl
 - **Add delays after navigation**: After pressing Enter to navigate to a URL, add a `delay` step to let the page load before interacting with page elements. Use `{{"kind":"delay","ms":2000,"description":"Wait for page to load"}}`. Use 2000ms for typical pages, 3000-4000ms for heavy pages. Always add a delay between navigating and clicking page content.
-- **Right-click for context menus**: When the user's description mentions right-clicking, or the recording shows a context menu action (like "Open links"), use `rightClick` to open the context menu on the target element, then add a short `delay` (500ms) before clicking the menu item. The `rightClick` step uses the same `selector` format as `click`.
+- **Right-click for context menus**: When the user's description mentions right-clicking, or the recording shows a context menu action (like "Open links"), use `rightClickAt` with x,y coordinates to open the context menu, then add a short `delay` (500ms) before clicking the menu item.
+- **Use clickAt/rightClickAt for web page content**: AX selectors for elements inside web pages (Chrome, Safari, etc.) are unreliable — they often use generic roles like AXGroup with no title. For clicking on web page content, PREFER `clickAt` or `rightClickAt` with x,y screen coordinates from the recording's AX snapshots or spatial data. Format: `{{"kind":"clickAt","x":825,"y":647,"description":"Click PR links cell"}}` or `{{"kind":"rightClickAt","x":825,"y":647,"description":"Right-click on PR links"}}`.
+- **Screenshots are attached**: Keyframe screenshots from the recording are included above. Use them to understand the visual layout and verify that coordinate-based clicks will target the right area. The screenshots show exactly what the user saw during recording.
 
 ## Your task
 
@@ -151,7 +241,7 @@ Produce a refined automation workflow JSON that:
 2. **Infers intent** — understand what the user was actually trying to accomplish based on their description
 3. **Parameterizes inputs** — extract values like emails, names, URLs into the `inputs` array so the workflow is reusable
 4. **Uses clear step names** — add a human-readable `description` field to each step
-5. **Preserves the schema** — output must use the same step kinds: `focusWindow`, `click`, `rightClick`, `setText`, `waitFor`, `keyPress`, `delay`
+5. **Preserves the schema** — output must use the same step kinds: `focusWindow`, `click`, `rightClick`, `clickAt`, `rightClickAt`, `setText`, `waitFor`, `keyPress`, `delay`
 6. **Be conservative with waitFor** — only wait for elements when a prior action would cause them to appear. Do not wait for elements from context menus or transient popups unless explicitly shown in the recording.
 8. **Do NOT add verify blocks to focusWindow** — the focusWindow step uses NSWorkspace.activate() which is reliable. Adding a verify/windowVisible check requires extra AX permissions and frequently times out. Emit focusWindow steps WITHOUT a verify array.
 7. **Never invent selectors** — every `selector` in a `click`, `setText`, or `waitFor` step must come verbatim from the AX snapshots or V1 compiler output above. If the recording doesn't include a snapshot for an element, omit that step entirely rather than guessing. Guessed selectors will fail at runtime.
@@ -169,7 +259,7 @@ Return ONLY a JSON object with this structure (no markdown, no explanation):
   ],
   "steps": [
     {{
-      "kind": "focusWindow" | "click" | "rightClick" | "setText" | "waitFor" | "keyPress" | "delay",
+      "kind": "focusWindow" | "click" | "rightClick" | "clickAt" | "rightClickAt" | "setText" | "waitFor" | "keyPress" | "delay",
       "description": "<human-readable step description>",
       ... (kind-specific fields matching the v1 schema)
     }}
@@ -222,7 +312,7 @@ pub fn ai_refine_workflow(
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| format!("failed to create async runtime: {e}"))?;
 
-    runtime.block_on(call_claude_api(&api_key, &prompt))
+    runtime.block_on(call_claude_api(&api_key, &prompt, &[]))
 }
 
 fn build_refinement_prompt(
@@ -258,10 +348,13 @@ Common fixes:
 - If a right-click context menu item wasn't found, the menu may use `AXMenuItem` role, not `AXStaticText`
 - If steps happened too fast, add `delay` steps between them
 
-Available step kinds: `focusWindow`, `click`, `rightClick`, `setText`, `waitFor`, `keyPress`, `delay`
+Available step kinds: `focusWindow`, `click`, `rightClick`, `clickAt`, `rightClickAt`, `setText`, `waitFor`, `keyPress`, `delay`
 - `keyPress` example: `{{"kind":"keyPress","key":"n","modifiers":["cmd"]}}`
 - `delay` example: `{{"kind":"delay","ms":1000}}`
 - `setText` value must be: `{{"kind":"literal","value":"text"}}`
+- `clickAt` example: `{{"kind":"clickAt","x":825,"y":647}}` — clicks at screen coordinates, bypasses AX
+- `rightClickAt` example: `{{"kind":"rightClickAt","x":825,"y":647}}` — right-clicks at coordinates
+- If a selector-based click/rightClick failed, try switching to clickAt/rightClickAt using coordinates from the spatial fallback data in the original workflow
 - Keys: a-z, 0-9, return, tab, space, delete, escape, left, right, up, down
 - Modifiers: cmd, shift, alt, ctrl
 
@@ -292,8 +385,32 @@ struct UsageInfo {
     output_tokens: Option<u64>,
 }
 
-async fn call_claude_api(api_key: &str, prompt: &str) -> Result<AiCompileResult, String> {
+async fn call_claude_api(api_key: &str, prompt: &str, images: &[(String, String)]) -> Result<AiCompileResult, String> {
     let client = reqwest::Client::new();
+
+    let mut content_blocks: Vec<Value> = Vec::new();
+
+    // Add keyframe images first so the AI sees the screenshots before the text
+    for (b64_data, caption) in images {
+        content_blocks.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": b64_data,
+            }
+        }));
+        content_blocks.push(json!({
+            "type": "text",
+            "text": caption,
+        }));
+    }
+
+    // Add the main text prompt
+    content_blocks.push(json!({
+        "type": "text",
+        "text": prompt,
+    }));
 
     let body = json!({
         "model": ANTHROPIC_MODEL,
@@ -301,7 +418,7 @@ async fn call_claude_api(api_key: &str, prompt: &str) -> Result<AiCompileResult,
         "messages": [
             {
                 "role": "user",
-                "content": prompt,
+                "content": content_blocks,
             }
         ],
     });

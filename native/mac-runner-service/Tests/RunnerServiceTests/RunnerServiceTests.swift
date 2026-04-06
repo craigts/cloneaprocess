@@ -42,6 +42,14 @@ struct MockRunnerActionPerformer: RunnerActionPerforming {
         return ["action": "setText", "value": value]
     }
 
+    func clickAt(x: Double, y: Double, button: String) throws -> [String: Any] {
+        recorder.record("clickAt:\(Int(x)),\(Int(y)):\(button)")
+        if failOnKind == "clickAt" {
+            throw RunnerServiceError.executionFailed("clickAt failed")
+        }
+        return ["action": "clickAt", "x": x, "y": y, "button": button]
+    }
+
     func setTextFocused(value: String) throws -> [String: Any] {
         recorder.record("setTextFocused:\(value)")
         if failOnKind == "setText" {
