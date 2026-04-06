@@ -101,6 +101,7 @@ export function App() {
   const [aiRefining, setAiRefining] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
   const [aiMessage, setAiMessage] = useState<string | null>(null)
+  const [fixHint, setFixHint] = useState('')
   const [apiKeyDisplay, setApiKeyDisplay] = useState('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [apiKeySaving, setApiKeySaving] = useState(false)
@@ -236,6 +237,11 @@ export function App() {
     if (selectedSessionId == null) return
     setAiCompiling(true); setAiError(null); setAiMessage(null); setAiWorkflow(null)
     try {
+      // Auto-save description before compiling
+      const trimmed = descriptionDraft.trim()
+      if (trimmed !== (selectedSession?.description ?? '')) {
+        await invoke('update_session_description', { sessionId: selectedSessionId, description: trimmed || null })
+      }
       setAiWorkflow(await invoke<AiCompileResponse>('ai_compile_workflow', { sessionId: selectedSessionId }))
     } catch (err) { setAiError(String(err)) }
     finally { setAiCompiling(false) }
@@ -251,6 +257,7 @@ export function App() {
         workflowRunId: latestRun.id,
         sourceSessionId: selectedSessionId,
         sessionDescription: selectedSession?.description ?? null,
+        userHint: fixHint.trim() || null,
       })
       setAiWorkflow(result)
       const changed = result.workflowJson !== aiWorkflow.workflowJson
@@ -518,13 +525,22 @@ export function App() {
         ) : null}
 
         {latestRun && latestRun.status === 'failed' ? (
-          <div className="failure-actions">
-            <button type="button" className="primary-btn" disabled={aiRefining || !aiWorkflow} onClick={() => void handleAiRefine()}>
-              {aiRefining ? 'AI is fixing...' : 'Fix with AI'}
-            </button>
-            <button type="button" className="copy-logs-btn" onClick={() => void handleCopyLogs()}>
-              Copy logs
-            </button>
+          <div className="fix-section">
+            <textarea
+              className="fix-hint"
+              rows={2}
+              placeholder="What went wrong? (e.g., 'Open links is inside View more cell actions submenu')"
+              value={fixHint}
+              onChange={(e) => setFixHint(e.target.value)}
+            />
+            <div className="failure-actions">
+              <button type="button" className="primary-btn" disabled={aiRefining || !aiWorkflow} onClick={() => void handleAiRefine()}>
+                {aiRefining ? 'AI is fixing...' : 'Fix with AI'}
+              </button>
+              <button type="button" className="copy-logs-btn" onClick={() => void handleCopyLogs()}>
+                Copy logs
+              </button>
+            </div>
           </div>
         ) : null}
 

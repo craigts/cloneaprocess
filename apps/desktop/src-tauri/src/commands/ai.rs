@@ -37,6 +37,7 @@ pub fn ai_refine_workflow(
     workflow_run_id: i64,
     source_session_id: Option<i64>,
     session_description: Option<String>,
+    user_hint: Option<String>,
 ) -> Result<AiCompileResponse, String> {
     let result = ai_compiler::ai_refine_workflow(
         state.storage(),
@@ -44,6 +45,7 @@ pub fn ai_refine_workflow(
         workflow_run_id,
         source_session_id,
         session_description.as_deref(),
+        user_hint.as_deref(),
     )?;
 
     Ok(AiCompileResponse {

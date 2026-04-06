@@ -284,6 +284,7 @@ pub fn ai_refine_workflow(
     run_id: i64,
     source_session_id: Option<i64>,
     session_description: Option<&str>,
+    user_hint: Option<&str>,
 ) -> Result<AiCompileResult, String> {
     let api_key = resolve_api_key(storage)?;
 
@@ -328,6 +329,7 @@ pub fn ai_refine_workflow(
         &logs_text.join("\n\n"),
         session_description.unwrap_or("(no description)"),
         &ax_snapshots_json,
+        user_hint,
     );
 
     let runtime = tokio::runtime::Runtime::new()
@@ -341,14 +343,23 @@ fn build_refinement_prompt(
     run_logs: &str,
     description: &str,
     ax_snapshots_json: &str,
+    user_hint: Option<&str>,
 ) -> String {
+    let hint_section = match user_hint {
+        Some(hint) if !hint.trim().is_empty() => format!(
+            "\n## IMPORTANT: User's hint about what went wrong\n\nThe user says: \"{}\"\n\nThis is the most important piece of information. Follow this guidance precisely when fixing the workflow.\n",
+            hint.trim()
+        ),
+        _ => String::new(),
+    };
+
     format!(
         r#"You are an expert at debugging and fixing macOS automation workflows.
 
 ## User's description of what they want to automate
 
 {description}
-
+{hint_section}
 ## AX snapshots from the original recording
 
 These are the accessibility elements captured during the user's recording. Use them to understand the UI structure, including menu items, submenus, and element hierarchy:

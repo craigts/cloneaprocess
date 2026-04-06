@@ -231,6 +231,27 @@ button, input, textarea, select { font: inherit; }
   font-size: 0.92rem;
 }
 
+.fix-section {
+  margin-top: 0.75rem;
+}
+
+.fix-hint {
+  display: block;
+  width: 100%;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid rgba(154, 90, 27, 0.2);
+  border-radius: 12px;
+  background: rgba(255, 250, 240, 0.7);
+  resize: vertical;
+  line-height: 1.4;
+  font-size: 0.92rem;
+  margin-bottom: 0.65rem;
+}
+
+.fix-hint::placeholder {
+  color: rgba(154, 90, 27, 0.4);
+}
+
 .failure-actions {
   display: flex;
   flex-wrap: wrap;
