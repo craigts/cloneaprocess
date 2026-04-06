@@ -123,6 +123,7 @@ pub struct SessionRecord {
     pub id: i64,
     pub external_id: String,
     pub label: Option<String>,
+    pub description: Option<String>,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub status: String,
@@ -559,6 +560,25 @@ impl Storage {
         Ok(())
     }
 
+    pub fn update_session_description(
+        &self,
+        session_id: i64,
+        description: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "UPDATE sessions SET description = ? WHERE id = ?",
+        )?;
+        if let Some(description) = description {
+            statement.bind_text(1, description)?;
+        } else {
+            statement.bind_null(1)?;
+        }
+        statement.bind_int64(2, session_id)?;
+        statement.execute()?;
+        Ok(())
+    }
+
     pub fn update_session_summary(
         &self,
         session_id: i64,
@@ -596,6 +616,7 @@ impl Storage {
                 id,
                 external_id,
                 label,
+                description,
                 started_at_ms,
                 ended_at_ms,
                 status,
@@ -617,18 +638,19 @@ impl Storage {
                 id: statement.column_int64(0),
                 external_id: statement.column_text(1)?.unwrap_or_default(),
                 label: statement.column_text(2)?,
-                started_at_ms: statement.column_int64(3) as u64,
-                ended_at_ms: if statement.column_is_null(4) {
+                description: statement.column_text(3)?,
+                started_at_ms: statement.column_int64(4) as u64,
+                ended_at_ms: if statement.column_is_null(5) {
                     None
                 } else {
-                    Some(statement.column_int64(4) as u64)
+                    Some(statement.column_int64(5) as u64)
                 },
-                status: statement.column_text(5)?.unwrap_or_default(),
-                app_transition_count: statement.column_int64(6),
-                ax_snapshot_count: statement.column_int64(7),
-                keyframe_count_cached: statement.column_int64(8),
-                last_error: statement.column_text(9)?,
-                created_at_ms: statement.column_int64(10) as u64,
+                status: statement.column_text(6)?.unwrap_or_default(),
+                app_transition_count: statement.column_int64(7),
+                ax_snapshot_count: statement.column_int64(8),
+                keyframe_count_cached: statement.column_int64(9),
+                last_error: statement.column_text(10)?,
+                created_at_ms: statement.column_int64(11) as u64,
             });
         }
 
@@ -643,6 +665,7 @@ impl Storage {
                 id,
                 external_id,
                 label,
+                description,
                 started_at_ms,
                 ended_at_ms,
                 status,
@@ -666,18 +689,19 @@ impl Storage {
             id: statement.column_int64(0),
             external_id: statement.column_text(1)?.unwrap_or_default(),
             label: statement.column_text(2)?,
-            started_at_ms: statement.column_int64(3) as u64,
-            ended_at_ms: if statement.column_is_null(4) {
+            description: statement.column_text(3)?,
+            started_at_ms: statement.column_int64(4) as u64,
+            ended_at_ms: if statement.column_is_null(5) {
                 None
             } else {
-                Some(statement.column_int64(4) as u64)
+                Some(statement.column_int64(5) as u64)
             },
-            status: statement.column_text(5)?.unwrap_or_default(),
-            app_transition_count: statement.column_int64(6),
-            ax_snapshot_count: statement.column_int64(7),
-            keyframe_count_cached: statement.column_int64(8),
-            last_error: statement.column_text(9)?,
-            created_at_ms: statement.column_int64(10) as u64,
+            status: statement.column_text(6)?.unwrap_or_default(),
+            app_transition_count: statement.column_int64(7),
+            ax_snapshot_count: statement.column_int64(8),
+            keyframe_count_cached: statement.column_int64(9),
+            last_error: statement.column_text(10)?,
+            created_at_ms: statement.column_int64(11) as u64,
         }))
     }
 
@@ -954,6 +978,10 @@ impl Storage {
             &connection,
             "ALTER TABLE sessions ADD COLUMN last_error TEXT",
         )?;
+        apply_optional_migration(
+            &connection,
+            "ALTER TABLE sessions ADD COLUMN description TEXT",
+        )?;
         connection.exec_batch(
             r#"
             UPDATE sessions
@@ -993,7 +1021,26 @@ impl Storage {
         Connection::open(&self.db_path)
     }
 
-    fn upsert_app_setting(&self, key: &str, value: &str) -> Result<(), StorageError> {
+    pub fn get_app_setting(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT value
+            FROM app_settings
+            WHERE key = ?
+            LIMIT 1
+            "#,
+        )?;
+        statement.bind_text(1, key)?;
+
+        if !statement.step()? {
+            return Ok(None);
+        }
+
+        statement.column_text(0)
+    }
+
+    pub fn upsert_app_setting(&self, key: &str, value: &str) -> Result<(), StorageError> {
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             r#"

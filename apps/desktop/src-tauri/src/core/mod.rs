@@ -1,3 +1,4 @@
+pub mod ai_compiler;
 pub mod app_state;
 pub mod helper_paths;
 pub mod recorder;

@@ -93,6 +93,34 @@ pub fn execute_session_workflow(
 }
 
 #[tauri::command]
+pub fn execute_workflow_json(
+    state: State<'_, AppState>,
+    workflow_json: String,
+    source_session_id: Option<i64>,
+) -> Result<WorkflowExecutionResponse, String> {
+    let workflow: serde_json::Value = serde_json::from_str(&workflow_json)
+        .map_err(|error| format!("invalid workflow JSON: {error}"))?;
+    let summary = workflow::execute_workflow(
+        state.storage(),
+        state.runner_binary(),
+        &workflow,
+        source_session_id,
+    )?;
+
+    Ok(WorkflowExecutionResponse {
+        run_row_id: summary.run_row_id,
+        run_external_id: summary.run_external_id,
+        workflow_id: summary.workflow_id,
+        workflow_name: summary.workflow_name,
+        status: summary.status,
+        step_count: summary.step_count,
+        completed_step_count: summary.completed_step_count,
+        failed_step_index: summary.failed_step_index,
+        last_error: summary.last_error,
+    })
+}
+
+#[tauri::command]
 pub fn approve_workflow_run(
     state: State<'_, AppState>,
     workflow_run_id: i64,

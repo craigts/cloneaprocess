@@ -26,12 +26,37 @@ struct MockRunnerActionPerformer: RunnerActionPerforming {
         return ["action": "click", "selector": selector]
     }
 
+    func rightClick(selector: [String: Any]) throws -> [String: Any] {
+        recorder.record("rightClick")
+        if failOnKind == "rightClick" {
+            throw RunnerServiceError.executionFailed("rightClick failed")
+        }
+        return ["action": "rightClick", "selector": selector]
+    }
+
     func setText(selector: [String: Any], value: String) throws -> [String: Any] {
         recorder.record("setText:\(value)")
         if failOnKind == "setText" {
             throw RunnerServiceError.executionFailed("setText failed")
         }
         return ["action": "setText", "value": value]
+    }
+
+    func setTextFocused(value: String) throws -> [String: Any] {
+        recorder.record("setTextFocused:\(value)")
+        if failOnKind == "setText" {
+            throw RunnerServiceError.executionFailed("setText failed")
+        }
+        return ["action": "setText", "value": value, "target": "focused"]
+    }
+
+    func keyPress(key: String, modifiers: [String]) throws -> [String: Any] {
+        let label = modifiers.isEmpty ? "keyPress:\(key)" : "keyPress:\(modifiers.joined(separator: "+"))+\(key)"
+        recorder.record(label)
+        if failOnKind == "keyPress" {
+            throw RunnerServiceError.executionFailed("keyPress failed")
+        }
+        return ["action": "keyPress", "key": key, "modifiers": modifiers]
     }
 
     func selectMenu(path: [String]) throws -> [String: Any] {

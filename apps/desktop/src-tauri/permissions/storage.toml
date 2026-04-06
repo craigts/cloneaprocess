@@ -39,6 +39,11 @@ description = "Enables the update_retention_policy command without any pre-confi
 commands.allow = ["update_retention_policy"]
 
 [[permission]]
+identifier = "allow-update-session-description"
+description = "Enables the update_session_description command without any pre-configured scope."
+commands.allow = ["update_session_description"]
+
+[[permission]]
 identifier = "allow-run-retention-cleanup-now"
 description = "Enables the run_retention_cleanup_now command without any pre-configured scope."
 commands.allow = ["run_retention_cleanup_now"]

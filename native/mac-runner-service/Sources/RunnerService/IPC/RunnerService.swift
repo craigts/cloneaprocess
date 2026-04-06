@@ -17,13 +17,17 @@ private let runnerProtocolCapabilities = [
     "set_text",
     "menu_navigation",
     "verification_hooks",
+    "key_press",
     "subprocess_bridge",
 ]
 
 protocol RunnerActionPerforming {
     func focusWindow(bundleId: String, title: String?) throws -> [String: Any]
     func click(selector: [String: Any]) throws -> [String: Any]
+    func rightClick(selector: [String: Any]) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
+    func setTextFocused(value: String) throws -> [String: Any]
+    func keyPress(key: String, modifiers: [String]) throws -> [String: Any]
     func selectMenu(path: [String]) throws -> [String: Any]
     func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any]
     func assertCondition(condition: [String: Any]) throws -> [String: Any]
@@ -181,18 +185,44 @@ final class RunnerBridgeSession {
             }
             return try performer.click(selector: selector)
         case "setText":
+            let selector = step["selector"] as? [String: Any]
+            let literalValue: String
+            if let value = step["value"] as? [String: Any] {
+                let kind = value["kind"] as? String ?? ""
+                if kind == "literal", let v = value["value"] as? String {
+                    literalValue = v
+                } else if let v = value["default"] as? String {
+                    literalValue = v
+                } else if let v = value["value"] as? String {
+                    literalValue = v
+                } else {
+                    throw RunnerServiceError.invalidRequest("setText step requires a literal value")
+                }
+            } else if let plainValue = step["value"] as? String {
+                literalValue = plainValue
+            } else {
+                throw RunnerServiceError.invalidRequest("setText step requires a value")
+            }
+            if let selector {
+                return try performer.setText(selector: selector, value: literalValue)
+            } else {
+                return try performer.setTextFocused(value: literalValue)
+            }
+        case "rightClick":
             guard let selector = step["selector"] as? [String: Any] else {
-                throw RunnerServiceError.invalidRequest("setText step requires selector")
+                throw RunnerServiceError.invalidRequest("rightClick step requires selector")
             }
-            guard
-                let value = step["value"] as? [String: Any],
-                let kind = value["kind"] as? String,
-                kind == "literal",
-                let literalValue = value["value"] as? String
-            else {
-                throw RunnerServiceError.invalidRequest("setText step requires a literal value")
+            return try performer.rightClick(selector: selector)
+        case "keyPress":
+            guard let key = step["key"] as? String, !key.isEmpty else {
+                throw RunnerServiceError.invalidRequest("keyPress step requires key")
             }
-            return try performer.setText(selector: selector, value: literalValue)
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.keyPress(key: key, modifiers: modifiers)
+        case "delay":
+            let ms = (step["ms"] as? NSNumber)?.intValue ?? 1000
+            Thread.sleep(forTimeInterval: Double(ms) / 1000.0)
+            return ["action": "delay", "ms": ms]
         case "selectMenu":
             guard let path = step["path"] as? [String], !path.isEmpty else {
                 throw RunnerServiceError.invalidRequest("selectMenu step requires a non-empty path")
@@ -271,16 +301,36 @@ struct RunnerService {
     }
 
     func runBridge() {
-        let input = FileHandle.standardInput
+        // Use raw POSIX I/O to avoid all Foundation and C stdio buffering issues
+        // when spawned as a subprocess from the Tauri app.
+        var buffer = Data()
+        let readBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+        defer { readBuf.deallocate() }
+
         while true {
-            let chunkData = input.availableData
-            guard !chunkData.isEmpty else { break }
-            guard let chunk = String(data: chunkData, encoding: .utf8) else { continue }
-            for rawLine in chunk.split(separator: "\n") {
-                let lines = session.handle(jsonLine: String(rawLine))
+            let bytesRead = read(STDIN_FILENO, readBuf, 4096)
+            guard bytesRead > 0 else { break }
+            buffer.append(readBuf, count: bytesRead)
+
+            while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let lineData = buffer[buffer.startIndex..<newlineIndex]
+                buffer = buffer[(newlineIndex + 1)...]
+                guard let rawLine = String(data: lineData, encoding: .utf8), !rawLine.isEmpty else { continue }
+                let lines = session.handle(jsonLine: rawLine)
                 for line in lines {
-                    FileHandle.standardOutput.write(Data(line.utf8))
-                    FileHandle.standardOutput.write(Data("\n".utf8))
+                    let outputLine = line + "\n"
+                    if let data = outputLine.data(using: .utf8) {
+                        data.withUnsafeBytes { rawBuf in
+                            var remaining = rawBuf.count
+                            var offset = 0
+                            while remaining > 0 {
+                                let written = Darwin.write(STDOUT_FILENO, rawBuf.baseAddress! + offset, remaining)
+                                if written <= 0 { return }
+                                offset += written
+                                remaining -= written
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -324,6 +374,15 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         return ["action": "click"]
     }
 
+    func rightClick(selector: [String: Any]) throws -> [String: Any] {
+        let element = try resolveElement(selector: selector)
+        let result = AXUIElementPerformAction(element, kAXShowMenuAction as CFString)
+        guard result == .success else {
+            throw RunnerServiceError.executionFailed("AXShowMenu failed with code \(result.rawValue)")
+        }
+        return ["action": "rightClick"]
+    }
+
     func setText(selector: [String: Any], value: String) throws -> [String: Any] {
         let element = try resolveElement(selector: selector)
         let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef)
@@ -331,6 +390,68 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             throw RunnerServiceError.executionFailed("set value failed with code \(result.rawValue)")
         }
         return ["action": "setText", "value": value]
+    }
+
+    func setTextFocused(value: String) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard AXIsProcessTrusted() else {
+            throw RunnerServiceError.executionFailed("Accessibility permission is required")
+        }
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRaw: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRaw)
+        guard result == .success, let focused = focusedRaw else {
+            throw RunnerServiceError.executionFailed("no focused element found")
+        }
+        let element = focused as! AXUIElement
+        let setResult = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFTypeRef)
+        guard setResult == .success else {
+            throw RunnerServiceError.executionFailed("set value on focused element failed with code \(setResult.rawValue)")
+        }
+        return ["action": "setText", "value": value, "target": "focused"]
+        #else
+        throw RunnerServiceError.executionFailed("setText is only available on macOS")
+        #endif
+    }
+
+    func keyPress(key: String, modifiers: [String]) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let keyCode = keyCodeForName(key) else {
+            throw RunnerServiceError.invalidRequest("unknown key: \(key)")
+        }
+
+        var flags: CGEventFlags = []
+        for mod in modifiers {
+            switch mod.lowercased() {
+            case "cmd", "command": flags.insert(.maskCommand)
+            case "shift": flags.insert(.maskShift)
+            case "alt", "option": flags.insert(.maskAlternate)
+            case "ctrl", "control": flags.insert(.maskControl)
+            default: throw RunnerServiceError.invalidRequest("unknown modifier: \(mod)")
+            }
+        }
+
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true) else {
+            throw RunnerServiceError.executionFailed("failed to create key down event")
+        }
+        keyDown.flags = flags
+
+        guard let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+            throw RunnerServiceError.executionFailed("failed to create key up event")
+        }
+        keyUp.flags = flags
+
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+
+        return ["action": "keyPress", "key": key, "modifiers": modifiers]
+        #else
+        throw RunnerServiceError.executionFailed("keyPress is only available on macOS")
+        #endif
     }
 
     func selectMenu(path: [String]) throws -> [String: Any] {
@@ -713,5 +834,61 @@ private struct AXSelectorCandidate: Equatable {
             return number.stringValue
         }
         return nil
+    }
+}
+
+private func keyCodeForName(_ name: String) -> CGKeyCode? {
+    switch name.lowercased() {
+    case "a": return 0
+    case "s": return 1
+    case "d": return 2
+    case "f": return 3
+    case "h": return 4
+    case "g": return 5
+    case "z": return 6
+    case "x": return 7
+    case "c": return 8
+    case "v": return 9
+    case "b": return 11
+    case "q": return 12
+    case "w": return 13
+    case "e": return 14
+    case "r": return 15
+    case "y": return 16
+    case "t": return 17
+    case "1": return 18
+    case "2": return 19
+    case "3": return 20
+    case "4": return 21
+    case "6": return 22
+    case "5": return 23
+    case "9": return 25
+    case "7": return 26
+    case "8": return 28
+    case "0": return 29
+    case "o": return 31
+    case "u": return 32
+    case "i": return 34
+    case "p": return 35
+    case "l": return 37
+    case "j": return 38
+    case "k": return 40
+    case "n": return 45
+    case "m": return 46
+    case "return", "enter": return 36
+    case "tab": return 48
+    case "space": return 49
+    case "delete", "backspace": return 51
+    case "escape", "esc": return 53
+    case "left": return 123
+    case "right": return 124
+    case "down": return 125
+    case "up": return 126
+    case "f1": return 122
+    case "f2": return 120
+    case "f3": return 99
+    case "f4": return 118
+    case "f5": return 96
+    default: return nil
     }
 }

@@ -27,6 +27,7 @@ pub struct SessionSummary {
     id: i64,
     external_id: String,
     label: Option<String>,
+    description: Option<String>,
     started_at_ms: u64,
     ended_at_ms: Option<u64>,
     status: String,
@@ -236,6 +237,18 @@ pub fn run_retention_cleanup_now(
 }
 
 #[tauri::command]
+pub fn update_session_description(
+    state: State<'_, AppState>,
+    session_id: i64,
+    description: Option<String>,
+) -> Result<(), String> {
+    state
+        .storage()
+        .update_session_description(session_id, description.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn load_keyframe_bytes(path: String) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|error| format!("failed to read keyframe {}: {}", path, error))
 }
@@ -245,6 +258,7 @@ fn map_session(row: SessionRecord) -> SessionSummary {
         id: row.id,
         external_id: row.external_id,
         label: row.label,
+        description: row.description,
         started_at_ms: row.started_at_ms,
         ended_at_ms: row.ended_at_ms,
         status: row.status,
