@@ -225,6 +225,7 @@ impl RunnerBridge {
                         base64: payload.get("base64").and_then(Value::as_str).unwrap_or("").to_string(),
                         width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
                         height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        scale: payload.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -247,8 +248,12 @@ impl RunnerBridge {
 #[derive(Clone, Debug)]
 pub struct ScreenshotResult {
     pub base64: String,
+    /// Image dimensions in logical points (the runner downscales Retina captures so these
+    /// match the coordinate space `clickAt` posts mouse events in).
     pub width: u32,
     pub height: u32,
+    /// Backing scale factor of the captured display (physical pixels / logical points).
+    pub scale: f64,
 }
 
 impl RunnerStepExecutor for RunnerBridge {

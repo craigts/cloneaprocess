@@ -795,9 +795,38 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 
     func takeScreenshot(quality: Double) throws -> [String: Any] {
         #if canImport(ApplicationServices) && canImport(ImageIO) && canImport(UniformTypeIdentifiers)
-        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else {
+        let displayID = CGMainDisplayID()
+        guard let captured = CGDisplayCreateImage(displayID) else {
             throw RunnerServiceError.executionFailed("failed to capture screenshot")
         }
+
+        // CGDisplayCreateImage returns the frame buffer in *physical pixels* (e.g. 2880x1800
+        // on a Retina display), but mouse events in `clickAt` are posted in *logical points*
+        // (e.g. 1440x900). If we hand the model a physical-pixel image, every coordinate it
+        // returns is off by the display's backing scale factor. Downscale to logical points
+        // so the image the model sees shares the coordinate space we click in 1:1.
+        let pointWidth: Int
+        let pointHeight: Int
+        if let mode = CGDisplayCopyDisplayMode(displayID), mode.width > 0, mode.height > 0 {
+            pointWidth = mode.width
+            pointHeight = mode.height
+        } else {
+            // Fall back to the captured size (assume non-Retina / 1x) if the mode is unavailable.
+            pointWidth = captured.width
+            pointHeight = captured.height
+        }
+
+        let image: CGImage
+        if captured.width != pointWidth || captured.height != pointHeight {
+            guard let resized = Self.resize(captured, toWidth: pointWidth, toHeight: pointHeight) else {
+                throw RunnerServiceError.executionFailed("failed to downscale screenshot to logical points")
+            }
+            image = resized
+        } else {
+            image = captured
+        }
+
+        let scale = pointWidth > 0 ? Double(captured.width) / Double(pointWidth) : 1.0
 
         let data = NSMutableData()
         let jpegType = UTType.jpeg.identifier as CFString
@@ -813,17 +842,43 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 
         let base64 = (data as Data).base64EncodedString()
 
+        // `width`/`height` are reported in logical points so the model's coordinates map
+        // directly onto `clickAt`. `scale` and the raw pixel dims are included for diagnostics.
         return [
             "action": "screenshot",
             "base64": base64,
             "width": image.width,
             "height": image.height,
+            "scale": scale,
+            "pixelWidth": captured.width,
+            "pixelHeight": captured.height,
             "format": "jpeg",
         ]
         #else
         throw RunnerServiceError.executionFailed("screenshot is only available on macOS")
         #endif
     }
+
+    #if canImport(ApplicationServices)
+    /// Downscales a captured frame to the target logical-point dimensions.
+    private static func resize(_ image: CGImage, toWidth width: Int, toHeight height: Int) -> CGImage? {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
+    }
+    #endif
 }
 
 private struct SelectorCriteria {
