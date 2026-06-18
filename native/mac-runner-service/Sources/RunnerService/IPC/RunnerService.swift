@@ -1238,6 +1238,14 @@ private func keyCodeForName(_ name: String) -> CGKeyCode? {
     case "return", "enter", "kp_enter": return 36
     case "tab": return 48
     case "space": return 49
+    // Modifier keys as standalone keys (e.g. hold_key "cmd"). Modifiers passed in the `modifiers`
+    // array are handled separately via event flags; this is for pressing/holding the key itself.
+    case "command", "cmd", "super", "meta": return 55
+    case "shift", "left_shift": return 56
+    case "capslock", "caps_lock": return 57
+    case "option", "alt", "left_alt": return 58
+    case "control", "ctrl", "left_control": return 59
+    case "function", "fn": return 63
     case "delete", "backspace": return 51
     case "forward_delete", "forwarddelete": return 117
     case "escape", "esc": return 53
