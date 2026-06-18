@@ -501,8 +501,19 @@ fn placeholder() -> Value {
 
 fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -> String {
     let description = session.description.as_deref().unwrap_or("(no description)");
-    let mut steps = Vec::new();
+    let mut steps: Vec<String> = Vec::new();
     let mut last_app: Option<String> = None;
+    // Accumulates printable keystrokes so we can report the actual typed string (e.g.
+    // "/remote-control") instead of a generic "Typed text".
+    let mut typed_buffer = String::new();
+
+    let flush_typed = |steps: &mut Vec<String>, buffer: &mut String| {
+        let text = buffer.trim();
+        if !text.is_empty() {
+            steps.push(format!("Typed \"{text}\""));
+        }
+        buffer.clear();
+    };
 
     for event in events {
         let envelope: Value = match serde_json::from_str(&event.event_json) {
@@ -510,6 +521,11 @@ fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -
             Err(_) => continue,
         };
         let payload = envelope.get("payload").cloned().unwrap_or_else(|| json!({}));
+
+        // Any non-typing event ends the current typed run.
+        if event.event_type != "key_down" && event.event_type != "key_up" {
+            flush_typed(&mut steps, &mut typed_buffer);
+        }
 
         match event.event_type.as_str() {
             "frontmost_app_changed" => {
@@ -520,34 +536,39 @@ fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -
                     last_app = Some(name.to_string());
                 }
             }
-            "mouse_down" => {
-                steps.push("Clicked".to_string());
-            }
             "ax_snapshot" => {
-                let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
-                let title = payload.get("title").and_then(Value::as_str).unwrap_or("");
-                if !title.is_empty() {
-                    steps.push(format!("Interacted with {role} \"{title}\""));
+                // The recorder captures title/description/identifier/role; use the most specific
+                // text available so clicks on named items (a session row, a button) carry intent
+                // — not just "Clicked" or a bare "AXScrollArea".
+                let role = payload.get("role").and_then(Value::as_str).unwrap_or("element");
+                let label = ["title", "description", "identifier"].iter()
+                    .find_map(|k| payload.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()));
+                match label {
+                    Some(text) => steps.push(format!("Clicked {role} \"{text}\"")),
+                    None => steps.push(format!("Clicked {role}")),
                 }
             }
             "key_down" => {
-                if steps.last().map(|s| s.starts_with("Typed")).unwrap_or(false) {
-                    // Already noted typing
-                } else {
-                    steps.push("Typed text".to_string());
+                let code = payload.get("key_code").and_then(Value::as_i64).unwrap_or(-1);
+                match keycode_to_char(code) {
+                    Some('\n') => flush_typed(&mut steps, &mut typed_buffer), // Return ends a field
+                    Some('\u{8}') => { typed_buffer.pop(); }                  // Backspace
+                    Some(c) => typed_buffer.push(c),
+                    None => {} // modifier / unmapped key — ignored for text reconstruction
                 }
             }
             _ => {}
         }
     }
+    flush_typed(&mut steps, &mut typed_buffer);
 
-    // Deduplicate consecutive "Clicked" entries
-    let mut deduped = Vec::new();
-    for step in &steps {
-        if step == "Clicked" && deduped.last().map(|s: &String| s == "Clicked").unwrap_or(false) {
+    // Collapse consecutive identical steps (e.g. repeated bare "Clicked AXScrollArea").
+    let mut deduped: Vec<String> = Vec::new();
+    for step in steps {
+        if deduped.last() == Some(&step) {
             continue;
         }
-        deduped.push(step.clone());
+        deduped.push(step);
     }
 
     format!(
@@ -558,6 +579,27 @@ fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+/// Maps a macOS virtual keycode to the character it produces on a US layout (unshifted). Used to
+/// reconstruct typed text from recorded key events, which capture only the keycode. Returns '\n'
+/// for Return and '\u{8}' for Delete/Backspace; None for modifiers and unmapped keys.
+fn keycode_to_char(code: i64) -> Option<char> {
+    let c = match code {
+        0 => 'a', 1 => 's', 2 => 'd', 3 => 'f', 4 => 'h', 5 => 'g', 6 => 'z', 7 => 'x',
+        8 => 'c', 9 => 'v', 11 => 'b', 12 => 'q', 13 => 'w', 14 => 'e', 15 => 'r', 16 => 'y',
+        17 => 't', 31 => 'o', 32 => 'u', 34 => 'i', 35 => 'p', 37 => 'l', 38 => 'j', 40 => 'k',
+        45 => 'n', 46 => 'm',
+        18 => '1', 19 => '2', 20 => '3', 21 => '4', 23 => '5', 22 => '6', 26 => '7', 28 => '8',
+        25 => '9', 29 => '0',
+        27 => '-', 24 => '=', 33 => '[', 30 => ']', 42 => '\\', 41 => ';', 39 => '\'',
+        43 => ',', 47 => '.', 44 => '/', 50 => '`',
+        49 => ' ',
+        36 => '\n',    // Return
+        51 => '\u{8}', // Delete / Backspace
+        _ => return None,
+    };
+    Some(c)
 }
 
 fn load_recording_keyframes(events: &[RawEventRecord]) -> Vec<(String, String)> {
