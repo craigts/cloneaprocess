@@ -26,6 +26,7 @@ private let runnerProtocolCapabilities = [
     "key_press",
     "screenshot",
     "subprocess_bridge",
+    "computer_use",
 ]
 
 protocol RunnerActionPerforming {
@@ -33,13 +34,42 @@ protocol RunnerActionPerforming {
     func click(selector: [String: Any]) throws -> [String: Any]
     func rightClick(selector: [String: Any]) throws -> [String: Any]
     func clickAt(x: Double, y: Double, button: String) throws -> [String: Any]
+    // Computer-use clicking: multi-click (double/triple) and held modifiers (shift/cmd-click).
+    func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
     func setTextFocused(value: String) throws -> [String: Any]
+    // Types a literal string as real keystrokes into the focused element (reliable in browsers,
+    // unlike AX value-set). Backs the computer-use `type` action.
+    func typeText(text: String) throws -> [String: Any]
     func keyPress(key: String, modifiers: [String]) throws -> [String: Any]
+    func moveMouse(x: Double, y: Double) throws -> [String: Any]
+    func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any]
+    func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any]
     func selectMenu(path: [String]) throws -> [String: Any]
     func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any]
     func assertCondition(condition: [String: Any]) throws -> [String: Any]
     func takeScreenshot(quality: Double) throws -> [String: Any]
+}
+
+// Default implementations so conformers (e.g. test mocks) needn't implement every computer-use
+// primitive. Declaring them in the protocol body keeps dispatch dynamic — `LiveRunnerActionPerformer`
+// overrides take effect when called through the protocol.
+extension RunnerActionPerforming {
+    func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
+        try clickAt(x: x, y: y, button: button)
+    }
+    func typeText(text: String) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("typeText is not supported by this performer")
+    }
+    func moveMouse(x: Double, y: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("moveMouse is not supported by this performer")
+    }
+    func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("scroll is not supported by this performer")
+    }
+    func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("dragTo is not supported by this performer")
+    }
 }
 
 enum RunnerServiceError: Error {
@@ -231,13 +261,44 @@ final class RunnerBridgeSession {
                   let y = (step["y"] as? NSNumber)?.doubleValue else {
                 throw RunnerServiceError.invalidRequest("clickAt step requires x and y coordinates")
             }
-            return try performer.clickAt(x: x, y: y, button: "left")
+            let button = step["button"] as? String ?? "left"
+            let clickCount = (step["clickCount"] as? NSNumber)?.intValue ?? 1
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
         case "rightClickAt":
             guard let x = (step["x"] as? NSNumber)?.doubleValue,
                   let y = (step["y"] as? NSNumber)?.doubleValue else {
                 throw RunnerServiceError.invalidRequest("rightClickAt step requires x and y coordinates")
             }
-            return try performer.clickAt(x: x, y: y, button: "right")
+            return try performer.clickAt(x: x, y: y, button: "right", clickCount: 1, modifiers: [])
+        case "moveMouse":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("moveMouse step requires x and y coordinates")
+            }
+            return try performer.moveMouse(x: x, y: y)
+        case "typeText":
+            guard let text = step["text"] as? String else {
+                throw RunnerServiceError.invalidRequest("typeText step requires text")
+            }
+            return try performer.typeText(text: text)
+        case "scroll":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("scroll step requires x and y coordinates")
+            }
+            let direction = step["direction"] as? String ?? "down"
+            let amount = (step["amount"] as? NSNumber)?.intValue ?? 3
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.scroll(x: x, y: y, direction: direction, amount: amount, modifiers: modifiers)
+        case "drag":
+            guard let fromX = (step["fromX"] as? NSNumber)?.doubleValue,
+                  let fromY = (step["fromY"] as? NSNumber)?.doubleValue,
+                  let toX = (step["toX"] as? NSNumber)?.doubleValue,
+                  let toY = (step["toY"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("drag step requires fromX, fromY, toX, toY")
+            }
+            return try performer.dragTo(fromX: fromX, fromY: fromY, toX: toX, toY: toY)
         case "keyPress":
             guard let key = step["key"] as? String, !key.isEmpty else {
                 throw RunnerServiceError.invalidRequest("keyPress step requires key")
@@ -418,32 +479,167 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
     }
 
     func clickAt(x: Double, y: Double, button: String) throws -> [String: Any] {
+        try clickAt(x: x, y: y, button: button, clickCount: 1, modifiers: [])
+    }
+
+    func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
         #if canImport(ApplicationServices)
         let point = CGPoint(x: x, y: y)
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw RunnerServiceError.executionFailed("failed to create event source")
         }
 
-        let mouseButton: CGMouseButton = button == "right" ? .right : .left
-        let downType: CGEventType = button == "right" ? .rightMouseDown : .leftMouseDown
-        let upType: CGEventType = button == "right" ? .rightMouseUp : .leftMouseUp
-
-        guard let mouseDown = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton) else {
-            throw RunnerServiceError.executionFailed("failed to create mouse down event")
+        let (mouseButton, downType, upType): (CGMouseButton, CGEventType, CGEventType)
+        switch button {
+        case "right":
+            (mouseButton, downType, upType) = (.right, .rightMouseDown, .rightMouseUp)
+        case "middle", "center", "other":
+            (mouseButton, downType, upType) = (.center, .otherMouseDown, .otherMouseUp)
+        default:
+            (mouseButton, downType, upType) = (.left, .leftMouseDown, .leftMouseUp)
         }
-        guard let mouseUp = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton) else {
-            throw RunnerServiceError.executionFailed("failed to create mouse up event")
+
+        let flags = try Self.eventFlags(for: modifiers)
+        let count = max(1, clickCount)
+
+        // A genuine double/triple click is a sequence of down/up pairs with an incrementing
+        // click-state field — posting independent single clicks won't register as a double click.
+        for click in 1...count {
+            guard let mouseDown = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton),
+                  let mouseUp = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton) else {
+                throw RunnerServiceError.executionFailed("failed to create mouse event")
+            }
+            mouseDown.setIntegerValueField(.mouseEventClickState, value: Int64(click))
+            mouseUp.setIntegerValueField(.mouseEventClickState, value: Int64(click))
+            mouseDown.flags = flags
+            mouseUp.flags = flags
+            mouseDown.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.04)
+            mouseUp.post(tap: .cghidEventTap)
+            if click < count { Thread.sleep(forTimeInterval: 0.04) }
         }
 
-        mouseDown.post(tap: .cghidEventTap)
-        Thread.sleep(forTimeInterval: 0.05)
-        mouseUp.post(tap: .cghidEventTap)
-
-        return ["action": "clickAt", "x": x, "y": y, "button": button]
+        return ["action": "clickAt", "x": x, "y": y, "button": button, "clickCount": count, "modifiers": modifiers]
         #else
         throw RunnerServiceError.executionFailed("clickAt is only available on macOS")
         #endif
     }
+
+    func moveMouse(x: Double, y: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left) else {
+            throw RunnerServiceError.executionFailed("failed to create mouse move event")
+        }
+        move.post(tap: .cghidEventTap)
+        return ["action": "moveMouse", "x": x, "y": y]
+        #else
+        throw RunnerServiceError.executionFailed("moveMouse is only available on macOS")
+        #endif
+    }
+
+    func typeText(text: String) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+        // Drive real keystrokes via a synthesized Unicode key event. Unlike AX value-set, this
+        // reaches web inputs and any focused control. Chunk to stay within the per-event buffer.
+        let scalars = Array(text.utf16)
+        let chunkSize = 20
+        var index = 0
+        while index < scalars.count {
+            let chunk = Array(scalars[index..<min(index + chunkSize, scalars.count)])
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                throw RunnerServiceError.executionFailed("failed to create keyboard event")
+            }
+            keyDown.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            keyUp.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.01)
+            index += chunkSize
+        }
+        return ["action": "typeText", "length": scalars.count]
+        #else
+        throw RunnerServiceError.executionFailed("typeText is only available on macOS")
+        #endif
+    }
+
+    func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+        // Position the cursor over the target first so the scroll lands in the right view.
+        if let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left) {
+            move.post(tap: .cghidEventTap)
+        }
+
+        // Each "amount" unit is a few scroll lines. Vertical → wheel1, horizontal → wheel2.
+        let lines = Int32(max(1, amount) * 3)
+        var wheel1: Int32 = 0
+        var wheel2: Int32 = 0
+        switch direction.lowercased() {
+        case "up": wheel1 = lines
+        case "down": wheel1 = -lines
+        case "left": wheel2 = lines
+        case "right": wheel2 = -lines
+        default: throw RunnerServiceError.invalidRequest("unknown scroll direction: \(direction)")
+        }
+
+        guard let scrollEvent = CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: wheel1, wheel2: wheel2, wheel3: 0) else {
+            throw RunnerServiceError.executionFailed("failed to create scroll event")
+        }
+        scrollEvent.flags = try Self.eventFlags(for: modifiers)
+        scrollEvent.post(tap: .cghidEventTap)
+        return ["action": "scroll", "direction": direction, "amount": amount]
+        #else
+        throw RunnerServiceError.executionFailed("scroll is only available on macOS")
+        #endif
+    }
+
+    func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+        let start = CGPoint(x: fromX, y: fromY)
+        let end = CGPoint(x: toX, y: toY)
+        guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left),
+              let drag = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: end, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left) else {
+            throw RunnerServiceError.executionFailed("failed to create drag event")
+        }
+        down.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.05)
+        drag.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.05)
+        up.post(tap: .cghidEventTap)
+        return ["action": "dragTo", "fromX": fromX, "fromY": fromY, "toX": toX, "toY": toY]
+        #else
+        throw RunnerServiceError.executionFailed("dragTo is only available on macOS")
+        #endif
+    }
+
+    #if canImport(ApplicationServices)
+    /// Maps modifier names (cmd/shift/alt/ctrl, plus the computer-use `super` alias for Command)
+    /// to CGEventFlags. Shared by click and scroll.
+    static func eventFlags(for modifiers: [String]) throws -> CGEventFlags {
+        var flags: CGEventFlags = []
+        for mod in modifiers {
+            switch mod.lowercased() {
+            case "cmd", "command", "super", "meta": flags.insert(.maskCommand)
+            case "shift": flags.insert(.maskShift)
+            case "alt", "option": flags.insert(.maskAlternate)
+            case "ctrl", "control": flags.insert(.maskControl)
+            default: throw RunnerServiceError.invalidRequest("unknown modifier: \(mod)")
+            }
+        }
+        return flags
+    }
+    #endif
 
     func setTextFocused(value: String) throws -> [String: Any] {
         #if canImport(ApplicationServices)
@@ -473,16 +669,7 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             throw RunnerServiceError.invalidRequest("unknown key: \(key)")
         }
 
-        var flags: CGEventFlags = []
-        for mod in modifiers {
-            switch mod.lowercased() {
-            case "cmd", "command": flags.insert(.maskCommand)
-            case "shift": flags.insert(.maskShift)
-            case "alt", "option": flags.insert(.maskAlternate)
-            case "ctrl", "control": flags.insert(.maskControl)
-            default: throw RunnerServiceError.invalidRequest("unknown modifier: \(mod)")
-            }
-        }
+        let flags = try Self.eventFlags(for: modifiers)
 
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw RunnerServiceError.executionFailed("failed to create event source")
@@ -1015,20 +1202,34 @@ private func keyCodeForName(_ name: String) -> CGKeyCode? {
     case "k": return 40
     case "n": return 45
     case "m": return 46
-    case "return", "enter": return 36
+    case "return", "enter", "kp_enter": return 36
     case "tab": return 48
     case "space": return 49
     case "delete", "backspace": return 51
+    case "forward_delete", "forwarddelete": return 117
     case "escape", "esc": return 53
     case "left": return 123
     case "right": return 124
     case "down": return 125
     case "up": return 126
+    case "home": return 115
+    case "end": return 119
+    case "page_up", "pageup", "prior": return 116
+    case "page_down", "pagedown", "next": return 121
+    case "minus": return 27
+    case "equal", "equals": return 24
     case "f1": return 122
     case "f2": return 120
     case "f3": return 99
     case "f4": return 118
     case "f5": return 96
+    case "f6": return 97
+    case "f7": return 98
+    case "f8": return 100
+    case "f9": return 101
+    case "f10": return 109
+    case "f11": return 103
+    case "f12": return 111
     default: return nil
     }
 }

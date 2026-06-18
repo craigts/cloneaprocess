@@ -10,13 +10,26 @@ use crate::core::runner::{RunnerBridge, RunnerStepExecutor, RunnerStepRequest};
 use crate::storage::{RawEventRecord, SessionRecord, Storage};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
+const ANTHROPIC_MODEL: &str = "claude-opus-4-8";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+// Computer-use beta. `computer_20251124` + this header are required for Opus 4.8 / 4.7 / 4.6,
+// Sonnet 4.6, and Opus 4.5. On these models the coordinates the model returns are 1:1 with the
+// pixels of the image we send (long edge up to 2576px), so no scale-factor conversion is needed —
+// the runner already hands us logical-point screenshots that match the click coordinate space.
+const ANTHROPIC_BETA: &str = "computer-use-2025-11-24";
+const COMPUTER_TOOL_TYPE: &str = "computer_20251124";
+// Thinking depth / token spend. `high` favours reliability over latency for autonomous control.
+const EFFORT: &str = "high";
+const MAX_RESPONSE_TOKENS: u32 = 8192;
+
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(6);
 const DEFAULT_MAX_STEPS: u32 = 50;
-const ACTION_SETTLE_MS: u64 = 300;
+const ACTION_SETTLE_MS: u64 = 400;
 const MAX_RECORDING_KEYFRAMES: usize = 4;
+// Keep only the most recent screenshots in the conversation. Older ones are replaced with a text
+// placeholder so context (and cost) stays bounded across long runs.
+const MAX_CONVERSATION_IMAGES: usize = 3;
 
 // ---- Public types ----
 
@@ -76,26 +89,42 @@ where
 
     let max_steps = if config.max_steps == 0 { DEFAULT_MAX_STEPS } else { config.max_steps };
     let mut step_number: u32 = 0;
-    let mut conversation: Vec<Value> = Vec::new();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
 
-    // Build initial messages
-    let system_prompt = build_system_prompt();
-    let first_user_message = build_first_user_message(
-        &session,
-        &recording_summary,
-        &recording_keyframes,
+    // Take an initial screenshot. Its (logical-point) dimensions define the computer tool's
+    // display size so the model's coordinates land 1:1 on our clicks.
+    let initial = runner.take_screenshot(SCREENSHOT_TIMEOUT)
+        .map_err(|e| format!("initial screenshot failed: {e}"))?;
+    eprintln!(
+        "[agent] display {}x{} logical points (backing scale {:.1}); clicks map 1:1",
+        initial.width, initial.height, initial.scale
     );
+    emit(AgentEvent::Screenshot {
+        step_number,
+        base64: initial.base64.clone(),
+        width: initial.width,
+        height: initial.height,
+    });
+
+    let tools = tool_definitions(initial.width, initial.height);
+    let system_prompt = build_system_prompt();
+
+    // Seed the conversation with the task, the recording walkthrough, and the live screen.
+    let mut first_content = build_first_user_message(&session, &recording_summary, &recording_keyframes);
+    first_content.push(json!({"type": "text", "text": "\nHere is the current state of the screen:"}));
+    first_content.push(image_block(&initial.base64));
+    first_content.push(json!({"type": "text", "text":
+        "Complete the task. Take one action at a time and check the result before the next."}));
+
+    let mut conversation: Vec<Value> = vec![json!({"role": "user", "content": first_content})];
 
     loop {
-        // Check cancellation
         if config.cancel_token.load(Ordering::Relaxed) {
             emit(AgentEvent::Cancelled { step_number });
             return Ok(());
         }
 
-        // Check step limit
         if step_number >= max_steps {
             emit(AgentEvent::Failed {
                 step_number,
@@ -104,176 +133,174 @@ where
             return Ok(());
         }
 
-        // 1. Take screenshot
-        let screenshot = runner.take_screenshot(SCREENSHOT_TIMEOUT)
-            .map_err(|e| format!("screenshot failed: {e}"))?;
+        // Drop stale screenshots before sending — keeps context bounded over long runs.
+        prune_images(&mut conversation, MAX_CONVERSATION_IMAGES);
 
-        emit(AgentEvent::Screenshot {
-            step_number,
-            base64: screenshot.base64.clone(),
-            width: screenshot.width,
-            height: screenshot.height,
-        });
-
-        // 2. Build the user turn with the screenshot
-        let user_turn = if step_number == 0 {
-            // First turn: include recording context + first screenshot
-            let mut content = first_user_message.clone();
-            content.push(json!({"type": "text", "text": "\nHere is the current state of the screen:"}));
-            content.push(json!({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": screenshot.base64}
-            }));
-            content.push(json!({"type": "text", "text": "What should I do first?"}));
-            json!({"role": "user", "content": content})
-        } else {
-            // Subsequent turns: just screenshot + result of previous action
-            let prev_result_text = conversation.last()
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-
-            json!({"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": screenshot.base64}},
-                {"type": "text", "text": if prev_result_text.is_empty() {
-                    "Here is the current screen. What should I do next?".to_string()
-                } else {
-                    format!("{prev_result_text}\n\nHere is the current screen. What should I do next?")
-                }}
-            ]})
-        };
-
-        // Add user turn to conversation (replace previous user message content to manage context)
-        conversation.push(user_turn);
-
-        // 3. Call Claude
         emit(AgentEvent::Thinking { step_number });
 
-        let api_result = runtime.block_on(call_claude_with_tools(
+        let api_result = runtime.block_on(call_claude(
             &config.api_key,
             &system_prompt,
+            &tools,
             &conversation,
         )).map_err(|e| format!("Claude API error: {e}"))?;
 
         total_input_tokens += api_result.input_tokens;
         total_output_tokens += api_result.output_tokens;
 
-        // Add assistant response to conversation
+        // Preserve the full assistant turn verbatim (including any thinking blocks) so multi-turn
+        // tool use stays valid.
         conversation.push(json!({"role": "assistant", "content": api_result.content.clone()}));
 
-        // 4. Process response
-        let tool_use = api_result.content.iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    Some(block.clone())
-                } else {
-                    None
-                }
-            })
-            .next();
+        let tool_uses: Vec<&Value> = api_result.content.iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .collect();
 
-        let Some(tool_call) = tool_use else {
-            // No tool call — check if Claude said "done" in text
+        if tool_uses.is_empty() {
+            // No tool call — the model considers the task done. Use its text as the summary.
             let text = api_result.content.iter()
                 .filter_map(|b| b.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join(" ");
             emit(AgentEvent::Completed {
                 step_number,
-                summary: text,
+                summary: if text.trim().is_empty() { "Task completed.".to_string() } else { text },
                 total_input_tokens,
                 total_output_tokens,
             });
             return Ok(());
-        };
+        }
 
-        let tool_name = tool_call.get("name").and_then(Value::as_str).unwrap_or("");
-        let tool_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
-        let tool_input = tool_call.get("input").cloned().unwrap_or_else(|| json!({}));
-        let description = tool_input.get("description").and_then(Value::as_str).unwrap_or(tool_name).to_string();
+        let mut tool_results: Vec<Value> = Vec::new();
 
-        // Handle "done" tool
-        if tool_name == "done" {
-            let summary = tool_input.get("summary").and_then(Value::as_str).unwrap_or("Task completed.").to_string();
-            // Add tool result to conversation
-            conversation.push(json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": tool_id, "content": "Task marked as complete."}
-            ]}));
-            emit(AgentEvent::Completed {
+        for tool_call in tool_uses {
+            let tool_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let input = tool_call.get("input").cloned().unwrap_or_else(|| json!({}));
+            let action = input.get("action").and_then(Value::as_str).unwrap_or("").to_string();
+            let description = describe_action(&action, &input);
+
+            emit(AgentEvent::Action {
                 step_number,
-                summary,
-                total_input_tokens,
-                total_output_tokens,
+                tool: "computer".to_string(),
+                description: description.clone(),
+                params: input.clone(),
             });
-            return Ok(());
+
+            let exec = execute_computer_action(&mut runner, &action, &input);
+
+            // Let the UI settle, then capture the result so the model sees the consequence.
+            std::thread::sleep(Duration::from_millis(ACTION_SETTLE_MS));
+            let shot = runner.take_screenshot(SCREENSHOT_TIMEOUT).ok();
+            if let Some(s) = &shot {
+                emit(AgentEvent::Screenshot {
+                    step_number,
+                    base64: s.base64.clone(),
+                    width: s.width,
+                    height: s.height,
+                });
+            }
+
+            let mut content: Vec<Value> = Vec::new();
+            let is_error = exec.is_err();
+            match &exec {
+                Ok(_) => {
+                    emit(AgentEvent::ActionResult { step_number, success: true, error: None });
+                }
+                Err(err) => {
+                    emit(AgentEvent::ActionResult { step_number, success: false, error: Some(err.clone()) });
+                    content.push(json!({"type": "text", "text": format!("Action failed: {err}")}));
+                }
+            }
+
+            match &shot {
+                Some(s) => content.push(image_block(&s.base64)),
+                None if content.is_empty() => {
+                    content.push(json!({"type": "text", "text":
+                        "Action completed, but a screenshot could not be captured."}));
+                }
+                None => {}
+            }
+
+            let mut result = json!({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": content,
+            });
+            if is_error {
+                result["is_error"] = json!(true);
+            }
+            tool_results.push(result);
         }
 
-        emit(AgentEvent::Action {
-            step_number,
-            tool: tool_name.to_string(),
-            description: description.clone(),
-            params: tool_input.clone(),
-        });
-
-        // 5. Execute the action
-        let action_result = execute_tool_action(&mut runner, tool_name, &tool_input);
-
-        match &action_result {
-            Ok(_) => {
-                emit(AgentEvent::ActionResult { step_number, success: true, error: None });
-                // Add tool result to conversation
-                conversation.push(json!({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": tool_id, "content": format!("Action '{description}' succeeded.")}
-                ]}));
-            }
-            Err(err) => {
-                emit(AgentEvent::ActionResult { step_number, success: false, error: Some(err.clone()) });
-                // Add error to conversation so Claude can adapt
-                conversation.push(json!({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": tool_id, "is_error": true, "content": format!("Action failed: {err}")}
-                ]}));
-            }
-        }
-
-        // 6. Brief pause for UI to settle
-        std::thread::sleep(Duration::from_millis(ACTION_SETTLE_MS));
+        conversation.push(json!({"role": "user", "content": tool_results}));
         step_number += 1;
     }
 }
 
 // ---- Tool execution ----
 
-fn execute_tool_action(runner: &mut RunnerBridge, tool_name: &str, input: &Value) -> Result<(), String> {
-    let step_json = match tool_name {
-        "click_at" => json!({
-            "kind": "clickAt",
-            "x": input.get("x").and_then(Value::as_f64).unwrap_or(0.0),
-            "y": input.get("y").and_then(Value::as_f64).unwrap_or(0.0),
-        }),
-        "right_click_at" => json!({
-            "kind": "rightClickAt",
-            "x": input.get("x").and_then(Value::as_f64).unwrap_or(0.0),
-            "y": input.get("y").and_then(Value::as_f64).unwrap_or(0.0),
-        }),
-        "type_text" => {
-            let text = input.get("text").and_then(Value::as_str).unwrap_or("");
-            json!({ "kind": "setText", "value": {"kind": "literal", "value": text} })
+fn execute_computer_action(runner: &mut RunnerBridge, action: &str, input: &Value) -> Result<(), String> {
+    // `screenshot` and `cursor_position` need no runner step — the screenshot we take after every
+    // action is the feedback the model is asking for.
+    if action == "screenshot" || action == "cursor_position" {
+        return Ok(());
+    }
+
+    let step_json = match action {
+        "left_click" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 1, "modifiers": modifiers_from_text(input)})
         }
-        "press_key" => json!({
-            "kind": "keyPress",
-            "key": input.get("key").and_then(Value::as_str).unwrap_or(""),
-            "modifiers": input.get("modifiers").cloned().unwrap_or_else(|| json!([])),
-        }),
-        "focus_app" => json!({
-            "kind": "focusWindow",
-            "bundleId": input.get("bundle_id").and_then(Value::as_str).unwrap_or(""),
-        }),
+        "right_click" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            json!({"kind": "clickAt", "x": x, "y": y, "button": "right", "clickCount": 1, "modifiers": modifiers_from_text(input)})
+        }
+        "middle_click" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            json!({"kind": "clickAt", "x": x, "y": y, "button": "middle", "clickCount": 1, "modifiers": modifiers_from_text(input)})
+        }
+        "double_click" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 2, "modifiers": modifiers_from_text(input)})
+        }
+        "triple_click" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 3, "modifiers": modifiers_from_text(input)})
+        }
+        "mouse_move" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            json!({"kind": "moveMouse", "x": x, "y": y})
+        }
+        "left_click_drag" => {
+            let (fx, fy) = coordinate(input, "start_coordinate")?;
+            let (tx, ty) = coordinate(input, "coordinate")?;
+            json!({"kind": "drag", "fromX": fx, "fromY": fy, "toX": tx, "toY": ty})
+        }
+        "type" => {
+            let text = input.get("text").and_then(Value::as_str)
+                .ok_or_else(|| "type action requires text".to_string())?;
+            json!({"kind": "typeText", "text": text})
+        }
+        "key" => {
+            let combo = input.get("text").and_then(Value::as_str)
+                .ok_or_else(|| "key action requires text".to_string())?;
+            let (key, modifiers) = parse_key_combo(combo);
+            if key.is_empty() {
+                return Err(format!("could not parse key combo: {combo}"));
+            }
+            json!({"kind": "keyPress", "key": key, "modifiers": modifiers})
+        }
+        "scroll" => {
+            let (x, y) = coordinate(input, "coordinate")?;
+            let direction = input.get("scroll_direction").and_then(Value::as_str).unwrap_or("down");
+            let amount = input.get("scroll_amount").and_then(Value::as_i64).unwrap_or(3);
+            json!({"kind": "scroll", "x": x, "y": y, "direction": direction, "amount": amount, "modifiers": modifiers_from_text(input)})
+        }
         "wait" => {
-            let secs = input.get("seconds").and_then(Value::as_f64).unwrap_or(1.0);
-            json!({ "kind": "delay", "ms": (secs * 1000.0) as u64 })
+            let secs = input.get("duration").and_then(Value::as_f64).unwrap_or(1.0);
+            json!({"kind": "delay", "ms": (secs * 1000.0) as u64})
         }
-        _ => return Err(format!("unknown tool: {tool_name}")),
+        other => return Err(format!("unsupported computer action: {other}")),
     };
 
     let request = RunnerStepRequest {
@@ -281,13 +308,139 @@ fn execute_tool_action(runner: &mut RunnerBridge, tool_name: &str, input: &Value
         outer_run_id: "agent_run".to_string(),
         step_index: 0,
         attempt: 1,
-        operation_label: tool_name.to_string(),
+        operation_label: action.to_string(),
         step: step_json,
     };
 
     runner.execute_step(&request, ACTION_TIMEOUT)
         .map(|_: crate::core::runner::RunnerStepResult| ())
         .map_err(|e: crate::core::runner::RunnerError| e.to_string())
+}
+
+fn coordinate(input: &Value, key: &str) -> Result<(f64, f64), String> {
+    let arr = input.get(key).and_then(Value::as_array)
+        .ok_or_else(|| format!("action requires {key} [x, y]"))?;
+    let x = arr.first().and_then(Value::as_f64)
+        .ok_or_else(|| format!("{key} missing x"))?;
+    let y = arr.get(1).and_then(Value::as_f64)
+        .ok_or_else(|| format!("{key} missing y"))?;
+    Ok((x, y))
+}
+
+/// On click/scroll actions the `text` field carries held modifier keys (e.g. "shift", "ctrl").
+fn modifiers_from_text(input: &Value) -> Vec<String> {
+    input.get("text").and_then(Value::as_str)
+        .map(|t| t.split('+').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Splits a `key` combo like "cmd+shift+t" into ("t", ["cmd", "shift"]). The runner lower-cases
+/// and maps key names (return, tab, page_down, arrows, letters, …) and modifier names itself.
+fn parse_key_combo(combo: &str) -> (String, Vec<String>) {
+    let parts: Vec<&str> = combo.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+    match parts.split_last() {
+        Some((key, modifiers)) => (
+            key.to_lowercase(),
+            modifiers.iter().map(|m| m.to_lowercase()).collect(),
+        ),
+        None => (String::new(), Vec::new()),
+    }
+}
+
+fn describe_action(action: &str, input: &Value) -> String {
+    match action {
+        "left_click" | "right_click" | "middle_click" | "double_click" | "triple_click" | "mouse_move" => {
+            match coordinate(input, "coordinate") {
+                Ok((x, y)) => format!("{action} at ({:.0}, {:.0})", x, y),
+                Err(_) => action.to_string(),
+            }
+        }
+        "type" => format!("type \"{}\"", input.get("text").and_then(Value::as_str).unwrap_or("")),
+        "key" => format!("press {}", input.get("text").and_then(Value::as_str).unwrap_or("")),
+        "scroll" => format!("scroll {}", input.get("scroll_direction").and_then(Value::as_str).unwrap_or("")),
+        "wait" => "wait".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn image_block(base64: &str) -> Value {
+    json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/jpeg", "data": base64}
+    })
+}
+
+// ---- Image pruning ----
+
+/// Replaces all but the most recent `keep` image blocks (top-level and inside tool_result content)
+/// with a short text placeholder, so the conversation doesn't accumulate megabytes of screenshots.
+fn prune_images(conversation: &mut [Value], keep: usize) {
+    let total = count_images(conversation);
+    if total <= keep {
+        return;
+    }
+    let mut to_remove = total - keep;
+
+    for message in conversation.iter_mut() {
+        if to_remove == 0 {
+            break;
+        }
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            if to_remove == 0 {
+                break;
+            }
+            match block.get("type").and_then(Value::as_str) {
+                Some("image") => {
+                    *block = placeholder();
+                    to_remove -= 1;
+                }
+                Some("tool_result") => {
+                    if let Some(inner) = block.get_mut("content").and_then(Value::as_array_mut) {
+                        for ib in inner.iter_mut() {
+                            if to_remove == 0 {
+                                break;
+                            }
+                            if ib.get("type").and_then(Value::as_str) == Some("image") {
+                                *ib = placeholder();
+                                to_remove -= 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn count_images(conversation: &[Value]) -> usize {
+    let mut count = 0;
+    for message in conversation {
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("image") => count += 1,
+                Some("tool_result") => {
+                    if let Some(inner) = block.get("content").and_then(Value::as_array) {
+                        count += inner.iter()
+                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+                            .count();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    count
+}
+
+fn placeholder() -> Value {
+    json!({"type": "text", "text": "[older screenshot omitted]"})
 }
 
 // ---- Recording summary ----
@@ -324,7 +477,6 @@ fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -
                 }
             }
             "key_down" => {
-                // Don't list every keystroke, just note text entry
                 if steps.last().map(|s| s.starts_with("Typed")).unwrap_or(false) {
                     // Already noted typing
                 } else {
@@ -398,20 +550,18 @@ fn load_recording_keyframes(events: &[RawEventRecord]) -> Vec<(String, String)> 
 // ---- Prompt building ----
 
 fn build_system_prompt() -> String {
-    r#"You are a macOS desktop automation agent. You can see the user's screen and perform actions to complete a task.
+    r#"You are a macOS desktop automation agent. You control the computer with the `computer` tool — taking screenshots and issuing mouse and keyboard actions to complete a task.
 
-You have been shown a recording of the user performing this task manually. Use it as a guide for what to do, but adapt based on what you actually see on screen.
+You have been shown a recording of the user performing this task manually. Use it as a guide for the goal and the rough sequence of steps, but always adapt to what you actually see on screen — windows, positions, and content may differ from the recording.
 
 RULES:
-- Perform exactly ONE action per turn using the provided tools
-- Always look at the screenshot carefully before acting
-- Click precisely on UI elements you can see — use the x,y coordinates from the screenshot
-- If an action doesn't produce the expected result, try a different approach
-- When the task is complete, call the "done" tool
-- For web page content (inside browsers), prefer click_at with coordinates over AX selectors
-- After navigating to a new page, use wait(2-3 seconds) to let it load before clicking
-- For context menus, use right_click_at, then wait(0.5), then click_at on the menu item you see
-- Common keyboard shortcuts: Cmd+T (new tab), Cmd+L (address bar), Cmd+N (new window), Cmd+W (close tab)"#
+- Take ONE action at a time, then look at the resulting screenshot before deciding the next action.
+- Coordinates are in the screenshot's pixel space; click precisely on the element you can see.
+- After navigating or opening something, use the `wait` action to let the UI load before acting.
+- Prefer keyboard shortcuts where they are reliable (e.g. cmd+t new tab, cmd+l address bar, cmd+c/cmd+v).
+- To type into a field, click it first, then use the `type` action.
+- If an action doesn't produce the expected result, try a different approach rather than repeating it.
+- When the task is fully complete, stop and briefly state what you accomplished (do not call the tool again)."#
         .to_string()
 }
 
@@ -427,14 +577,10 @@ fn build_first_user_message(
         "## Task\n\n{description}\n\n## How I did it when I recorded it\n\n{recording_summary}"
     )}));
 
-    // Add keyframe images from the recording
     if !keyframes.is_empty() {
         content.push(json!({"type": "text", "text": "\n## Key moments from my recording:"}));
         for (b64, caption) in keyframes {
-            content.push(json!({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
-            }));
+            content.push(image_block(b64));
             content.push(json!({"type": "text", "text": caption}));
         }
     }
@@ -442,97 +588,16 @@ fn build_first_user_message(
     content
 }
 
-// ---- Claude API with tools ----
+// ---- Claude API (computer use) ----
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "click_at",
-            "description": "Click at screen coordinates (x, y). Use this for clicking UI elements you can see in the screenshot.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number", "description": "X coordinate on screen"},
-                    "y": {"type": "number", "description": "Y coordinate on screen"},
-                    "description": {"type": "string", "description": "What you're clicking on"}
-                },
-                "required": ["x", "y", "description"]
-            }
-        }),
-        json!({
-            "name": "right_click_at",
-            "description": "Right-click at screen coordinates to open a context menu.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "number", "description": "X coordinate on screen"},
-                    "y": {"type": "number", "description": "Y coordinate on screen"},
-                    "description": {"type": "string", "description": "What you're right-clicking on"}
-                },
-                "required": ["x", "y", "description"]
-            }
-        }),
-        json!({
-            "name": "type_text",
-            "description": "Type text into the currently focused input field. Make sure to click on the field first.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to type"},
-                    "description": {"type": "string", "description": "What field you're typing into"}
-                },
-                "required": ["text", "description"]
-            }
-        }),
-        json!({
-            "name": "press_key",
-            "description": "Press a keyboard key, optionally with modifiers. Keys: a-z, 0-9, return, tab, space, delete, escape, up, down, left, right. Modifiers: cmd, shift, alt, ctrl.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Key name"},
-                    "modifiers": {"type": "array", "items": {"type": "string"}, "description": "Modifier keys (cmd, shift, alt, ctrl)"},
-                    "description": {"type": "string", "description": "What this keystroke does"}
-                },
-                "required": ["key", "description"]
-            }
-        }),
-        json!({
-            "name": "focus_app",
-            "description": "Open/focus a macOS application by bundle ID. Common: com.google.Chrome, com.apple.Safari, com.apple.finder, com.apple.Terminal.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "bundle_id": {"type": "string", "description": "macOS bundle identifier"},
-                    "description": {"type": "string", "description": "Which app to open"}
-                },
-                "required": ["bundle_id", "description"]
-            }
-        }),
-        json!({
-            "name": "wait",
-            "description": "Wait for a specified number of seconds. Use after navigation or actions that cause UI changes.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "seconds": {"type": "number", "description": "Seconds to wait"},
-                    "reason": {"type": "string", "description": "Why waiting"}
-                },
-                "required": ["seconds", "reason"]
-            }
-        }),
-        json!({
-            "name": "done",
-            "description": "Call this when the task is complete.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "Brief summary of what was accomplished"}
-                },
-                "required": ["summary"]
-            }
-        }),
-    ]
+fn tool_definitions(display_width: u32, display_height: u32) -> Vec<Value> {
+    vec![json!({
+        "type": COMPUTER_TOOL_TYPE,
+        "name": "computer",
+        "display_width_px": display_width,
+        "display_height_px": display_height,
+        "display_number": 1,
+    })]
 }
 
 #[derive(Deserialize)]
@@ -553,18 +618,21 @@ struct ClaudeResult {
     output_tokens: u64,
 }
 
-async fn call_claude_with_tools(
+async fn call_claude(
     api_key: &str,
     system_prompt: &str,
+    tools: &[Value],
     conversation: &[Value],
 ) -> Result<ClaudeResult, String> {
     let client = reqwest::Client::new();
 
     let body = json!({
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 1024,
+        "max_tokens": MAX_RESPONSE_TOKENS,
         "system": system_prompt,
-        "tools": tool_definitions(),
+        "tools": tools,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": EFFORT},
         "messages": conversation,
     });
 
@@ -572,6 +640,7 @@ async fn call_claude_with_tools(
         .post(ANTHROPIC_API_URL)
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_API_VERSION)
+        .header("anthropic-beta", ANTHROPIC_BETA)
         .header("content-type", "application/json")
         .json(&body)
         .send()
