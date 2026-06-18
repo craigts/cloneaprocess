@@ -42,6 +42,7 @@ protocol RunnerActionPerforming {
     // unlike AX value-set). Backs the computer-use `type` action.
     func typeText(text: String) throws -> [String: Any]
     func keyPress(key: String, modifiers: [String]) throws -> [String: Any]
+    func holdKey(key: String, modifiers: [String], durationMs: Int) throws -> [String: Any]
     func moveMouse(x: Double, y: Double) throws -> [String: Any]
     func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any]
     func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any]
@@ -60,6 +61,9 @@ extension RunnerActionPerforming {
     }
     func typeText(text: String) throws -> [String: Any] {
         throw RunnerServiceError.unsupportedStep("typeText is not supported by this performer")
+    }
+    func holdKey(key: String, modifiers: [String], durationMs: Int) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("holdKey is not supported by this performer")
     }
     func moveMouse(x: Double, y: Double) throws -> [String: Any] {
         throw RunnerServiceError.unsupportedStep("moveMouse is not supported by this performer")
@@ -305,6 +309,13 @@ final class RunnerBridgeSession {
             }
             let modifiers = step["modifiers"] as? [String] ?? []
             return try performer.keyPress(key: key, modifiers: modifiers)
+        case "holdKey":
+            guard let key = step["key"] as? String, !key.isEmpty else {
+                throw RunnerServiceError.invalidRequest("holdKey step requires key")
+            }
+            let modifiers = step["modifiers"] as? [String] ?? []
+            let durationMs = (step["durationMs"] as? NSNumber)?.intValue ?? 1000
+            return try performer.holdKey(key: key, modifiers: modifiers, durationMs: durationMs)
         case "delay":
             let ms = (step["ms"] as? NSNumber)?.intValue ?? 1000
             Thread.sleep(forTimeInterval: Double(ms) / 1000.0)
@@ -691,6 +702,28 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         return ["action": "keyPress", "key": key, "modifiers": modifiers]
         #else
         throw RunnerServiceError.executionFailed("keyPress is only available on macOS")
+        #endif
+    }
+
+    func holdKey(key: String, modifiers: [String], durationMs: Int) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let keyCode = keyCodeForName(key) else {
+            throw RunnerServiceError.invalidRequest("unknown key: \(key)")
+        }
+        let flags = try Self.eventFlags(for: modifiers)
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+            throw RunnerServiceError.executionFailed("failed to create keyboard event")
+        }
+        keyDown.flags = flags
+        keyUp.flags = flags
+        keyDown.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: Double(max(0, durationMs)) / 1000.0)
+        keyUp.post(tap: .cghidEventTap)
+        return ["action": "holdKey", "key": key, "modifiers": modifiers, "durationMs": durationMs]
+        #else
+        throw RunnerServiceError.executionFailed("holdKey is only available on macOS")
         #endif
     }
 

@@ -200,15 +200,18 @@ where
                 });
             }
 
+            // Report the result as ordinary (non-error) tool content so it can carry the
+            // screenshot — the API rejects images when `is_error` is true, and keeping the agent
+            // sighted on failures matters more than the error flag. The failure is conveyed in text.
             let mut content: Vec<Value> = Vec::new();
-            let is_error = exec.is_err();
             match &exec {
                 Ok(_) => {
                     emit(AgentEvent::ActionResult { step_number, success: true, error: None });
                 }
                 Err(err) => {
                     emit(AgentEvent::ActionResult { step_number, success: false, error: Some(err.clone()) });
-                    content.push(json!({"type": "text", "text": format!("Action failed: {err}")}));
+                    content.push(json!({"type": "text", "text":
+                        format!("That action could not be performed: {err}. Try a different approach.")}));
                 }
             }
 
@@ -221,15 +224,11 @@ where
                 None => {}
             }
 
-            let mut result = json!({
+            tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tool_id,
                 "content": content,
-            });
-            if is_error {
-                result["is_error"] = json!(true);
-            }
-            tool_results.push(result);
+            }));
         }
 
         conversation.push(json!({"role": "user", "content": tool_results}));
@@ -295,6 +294,16 @@ fn execute_computer_action(runner: &mut RunnerBridge, action: &str, input: &Valu
             let direction = input.get("scroll_direction").and_then(Value::as_str).unwrap_or("down");
             let amount = input.get("scroll_amount").and_then(Value::as_i64).unwrap_or(3);
             json!({"kind": "scroll", "x": x, "y": y, "direction": direction, "amount": amount, "modifiers": modifiers_from_text(input)})
+        }
+        "hold_key" => {
+            let combo = input.get("text").and_then(Value::as_str)
+                .ok_or_else(|| "hold_key action requires text".to_string())?;
+            let (key, modifiers) = parse_key_combo(combo);
+            if key.is_empty() {
+                return Err(format!("could not parse key combo: {combo}"));
+            }
+            let secs = input.get("duration").and_then(Value::as_f64).unwrap_or(1.0);
+            json!({"kind": "holdKey", "key": key, "modifiers": modifiers, "durationMs": (secs * 1000.0) as u64})
         }
         "wait" => {
             let secs = input.get("duration").and_then(Value::as_f64).unwrap_or(1.0);
