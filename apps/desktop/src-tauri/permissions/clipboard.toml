@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-copy-to-clipboard"
+description = "Enables the copy_to_clipboard command without any pre-configured scope."
+commands.allow = ["copy_to_clipboard"]

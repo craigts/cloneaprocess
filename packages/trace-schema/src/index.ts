@@ -40,6 +40,7 @@ export type AxSnapshotPayload = {
   subrole?: string
   title?: string
   description?: string
+  identifier?: string
   selector?: AxSelector
 }
 

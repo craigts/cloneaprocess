@@ -19,9 +19,20 @@ pub fn run() {
         .setup(|app| {
             let state = AppState::bootstrap(&app.handle())?;
             app.manage(state);
+            app.manage(commands::agent::AgentState::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::agent::start_agent,
+            commands::agent::stop_agent,
+            commands::ai::ai_compile_workflow,
+            commands::ai::ai_refine_workflow,
+            commands::ai::get_ai_api_key,
+            commands::ai::set_ai_api_key,
+            commands::clipboard::copy_to_clipboard,
+            commands::permissions::check_permissions,
+            commands::permissions::open_system_settings_pane,
+            commands::permissions::restart_recorder_service,
             commands::recorder::recorder_status,
             commands::storage::load_keyframe_bytes,
             commands::storage::list_session_events,
@@ -29,6 +40,7 @@ pub fn run() {
             commands::storage::get_retention_policy,
             commands::storage::list_workflow_run_logs,
             commands::storage::list_workflow_runs,
+            commands::storage::update_session_description,
             commands::storage::storage_smoke_test,
             commands::storage::run_retention_cleanup_now,
             commands::storage::update_retention_policy,
@@ -37,6 +49,7 @@ pub fn run() {
             commands::system::system_status,
             commands::workflow::compile_workflow_preview,
             commands::workflow::execute_session_workflow,
+            commands::workflow::execute_workflow_json,
             commands::workflow::approve_workflow_run,
             commands::workflow::reject_workflow_run
         ])

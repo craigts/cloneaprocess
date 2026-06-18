@@ -90,16 +90,20 @@ pub fn compile_workflow(
                         context.steps.push(json!({
                             "kind": "focusWindow",
                             "bundleId": bundle_id,
+                            "verify": [{
+                                "condition": {
+                                    "kind": "windowVisible",
+                                    "bundleId": bundle_id,
+                                },
+                                "timeoutMs": ELEMENT_WAIT_TIMEOUT_MS,
+                            }],
                         }));
                         context.last_bundle_id = Some(bundle_id.to_string());
                     }
                 }
             }
             "ax_snapshot" => {
-                let selector = payload
-                    .get("selector")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
+                let selector = build_ranked_selector(&payload).unwrap_or_else(|| json!({}));
                 if selector != json!({}) {
                     context.pending_snapshot = Some(SnapshotContext {
                         selector,
@@ -463,22 +467,18 @@ fn continue_workflow_execution<R: RunnerStepExecutor>(
                 }),
             )?;
 
-            let outcome = if kind == "waitFor" {
-                execute_wait_for_step(step)
-            } else {
-                runner
-                    .execute_step(
-                        &RunnerStepRequest {
-                            workflow_id: state.workflow_id.clone(),
-                            outer_run_id: state.run_external_id.clone(),
-                            step_index,
-                            attempt,
-                            step: step.clone(),
-                        },
-                        timeout,
-                    )
-                    .map(|value| value.result)
-            };
+            let outcome = execute_step_attempt(
+                storage,
+                runner,
+                &mut state.sequence,
+                state.run_row_id,
+                &state.workflow_id,
+                &state.run_external_id,
+                step_index,
+                attempt,
+                step,
+                timeout,
+            );
 
             match outcome {
                 Ok(result) => {
@@ -610,18 +610,163 @@ fn continue_workflow_execution<R: RunnerStepExecutor>(
     })
 }
 
-fn execute_wait_for_step(step: &Value) -> Result<Value, RunnerError> {
-    let timeout_ms = step
-        .get("timeoutMs")
-        .and_then(Value::as_u64)
-        .unwrap_or(ELEMENT_WAIT_TIMEOUT_MS);
+fn execute_step_attempt<R: RunnerStepExecutor>(
+    storage: &Storage,
+    runner: &mut R,
+    sequence: &mut i64,
+    run_row_id: i64,
+    workflow_id: &str,
+    run_external_id: &str,
+    step_index: usize,
+    attempt: u32,
+    step: &Value,
+    timeout: Duration,
+) -> Result<Value, RunnerError> {
+    let mut result = execute_runner_step(
+        runner,
+        workflow_id,
+        run_external_id,
+        step_index,
+        attempt,
+        "step",
+        step,
+        timeout,
+    )?;
+
+    let verification_hooks = verification_hooks_for_step(step);
+    if verification_hooks.is_empty() {
+        return Ok(result);
+    }
+
+    let mut verification_results = Vec::with_capacity(verification_hooks.len());
+    for (hook_index, hook) in verification_hooks.into_iter().enumerate() {
+        let verification_step = verification_step_from_hook(&hook);
+        append_run_log(
+            storage,
+            run_row_id,
+            sequence,
+            Some(step_index as i64),
+            "step_verification_started",
+            json!({
+                "kind": step_kind(step).unwrap_or("unknown"),
+                "hook_index": hook_index,
+                "attempt": attempt,
+                "verification_step": verification_step.clone(),
+            }),
+        )
+        .map_err(RunnerError::Bridge)?;
+
+        let outcome = execute_runner_step(
+            runner,
+            workflow_id,
+            run_external_id,
+            step_index,
+            attempt,
+            &format!("verify_{}", hook_index),
+            &verification_step,
+            Duration::from_millis(step_timeout_ms(&verification_step)),
+        );
+
+        match outcome {
+            Ok(verification_result) => {
+                append_run_log(
+                    storage,
+                    run_row_id,
+                    sequence,
+                    Some(step_index as i64),
+                    "step_verification_finished",
+                    json!({
+                        "kind": step_kind(step).unwrap_or("unknown"),
+                        "hook_index": hook_index,
+                        "attempt": attempt,
+                        "ok": true,
+                        "result": verification_result,
+                    }),
+                )
+                .map_err(RunnerError::Bridge)?;
+                verification_results.push(verification_result);
+            }
+            Err(error) => {
+                append_run_log(
+                    storage,
+                    run_row_id,
+                    sequence,
+                    Some(step_index as i64),
+                    "step_verification_finished",
+                    json!({
+                        "kind": step_kind(step).unwrap_or("unknown"),
+                        "hook_index": hook_index,
+                        "attempt": attempt,
+                        "ok": false,
+                        "error": runner_error_payload(&error),
+                    }),
+                )
+                .map_err(RunnerError::Bridge)?;
+                return Err(error);
+            }
+        }
+    }
+
+    if let Some(payload) = result.as_object_mut() {
+        payload.insert(
+            "verification".to_string(),
+            Value::Array(verification_results),
+        );
+        return Ok(result);
+    }
+
     Ok(json!({
-        "action": "waitFor",
-        "status": "skipped",
-        "reason": "verification_not_implemented",
-        "timeoutMs": timeout_ms,
-        "condition": step.get("condition").cloned().unwrap_or_else(|| json!({})),
+        "result": result,
+        "verification": verification_results,
     }))
+}
+
+fn execute_runner_step<R: RunnerStepExecutor>(
+    runner: &mut R,
+    workflow_id: &str,
+    run_external_id: &str,
+    step_index: usize,
+    attempt: u32,
+    operation_label: &str,
+    step: &Value,
+    timeout: Duration,
+) -> Result<Value, RunnerError> {
+    runner
+        .execute_step(
+            &RunnerStepRequest {
+                workflow_id: workflow_id.to_string(),
+                outer_run_id: run_external_id.to_string(),
+                step_index,
+                attempt,
+                operation_label: operation_label.to_string(),
+                step: step.clone(),
+            },
+            timeout,
+        )
+        .map(|value| value.result)
+}
+
+fn verification_hooks_for_step(step: &Value) -> Vec<Value> {
+    step.get("verify")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn verification_step_from_hook(hook: &Value) -> Value {
+    let condition = hook.get("condition").cloned().unwrap_or_else(|| json!({}));
+    if let Some(timeout_ms) = hook.get("timeoutMs").and_then(Value::as_u64) {
+        json!({
+            "kind": "waitFor",
+            "condition": condition,
+            "timeoutMs": timeout_ms,
+        })
+    } else {
+        json!({
+            "kind": "assert",
+            "condition": condition,
+        })
+    }
 }
 
 fn approval_request_for_step(step: &Value) -> Option<ApprovalRequest> {
@@ -782,6 +927,225 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn build_ranked_selector(payload: &serde_json::Map<String, Value>) -> Option<Value> {
+    let existing_selector = payload
+        .get("selector")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let existing_ax = existing_selector
+        .get("ax")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let role = string_field(&existing_ax, payload, "role");
+    let subrole = string_field(&existing_ax, payload, "subrole");
+    let title = string_field(&existing_ax, payload, "title");
+    let description = string_field(&existing_ax, payload, "description");
+    let identifier = string_field(&existing_ax, payload, "identifier");
+    let path = existing_ax.get("path").cloned().filter(|value| {
+        value
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    });
+
+    let mut ranking = Vec::new();
+    if identifier.is_some() {
+        push_ax_candidate(
+            &mut ranking,
+            "identifier",
+            100,
+            "stable accessibility identifier",
+            base_ax_selector(&role, &subrole, [("identifier", identifier.clone())]),
+        );
+    }
+    if title.is_some() {
+        push_ax_candidate(
+            &mut ranking,
+            "title",
+            90,
+            "visible accessibility title",
+            base_ax_selector(&role, &subrole, [("title", title.clone())]),
+        );
+    }
+    if description != title {
+        if description.is_some() {
+            push_ax_candidate(
+                &mut ranking,
+                "description",
+                75,
+                "accessibility description fallback",
+                base_ax_selector(&role, &subrole, [("description", description.clone())]),
+            );
+        }
+    }
+    if path.is_some() {
+        push_ax_candidate(
+            &mut ranking,
+            "path",
+            60,
+            "structural accessibility path fallback",
+            base_ax_selector_with_path(&role, &subrole, path.clone()),
+        );
+    }
+    push_ax_candidate(
+        &mut ranking,
+        "role",
+        40,
+        "broad role fallback",
+        base_ax_selector(&role, &subrole, []),
+    );
+
+    let mut fallbacks = ranking.iter().skip(1).cloned().collect::<Vec<_>>();
+    if identifier.is_none() && title.is_none() {
+        if let Some(spatial) = pointer_fallback(payload, description.as_deref(), role.as_deref()) {
+            fallbacks.push(spatial);
+        }
+    }
+
+    let primary_ax = ranking
+        .iter()
+        .find_map(|candidate| candidate.get("ax").cloned())
+        .unwrap_or_else(|| json!({}));
+
+    let mut selector = serde_json::Map::new();
+    if let Some(target_app) = existing_selector.get("targetApp").cloned().or_else(|| {
+        payload
+            .get("bundleId")
+            .and_then(Value::as_str)
+            .map(|bundle_id| json!({ "bundleId": bundle_id }))
+    }) {
+        selector.insert("targetApp".to_string(), target_app);
+    }
+    if primary_ax != json!({}) {
+        selector.insert("ax".to_string(), primary_ax);
+    }
+    if let Some(strategy) = ranking
+        .first()
+        .and_then(|candidate| candidate.get("strategy"))
+        .and_then(Value::as_str)
+    {
+        selector.insert("preferredStrategy".to_string(), json!(strategy));
+    }
+    if !ranking.is_empty() {
+        selector.insert("ranking".to_string(), Value::Array(ranking));
+    }
+    if !fallbacks.is_empty() {
+        selector.insert("fallbacks".to_string(), Value::Array(fallbacks));
+    }
+
+    if selector.is_empty() {
+        None
+    } else {
+        Some(Value::Object(selector))
+    }
+}
+
+fn string_field(
+    selector_ax: &serde_json::Map<String, Value>,
+    payload: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<String> {
+    selector_ax
+        .get(field)
+        .and_then(Value::as_str)
+        .or_else(|| payload.get(field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn base_ax_selector<const N: usize>(
+    role: &Option<String>,
+    subrole: &Option<String>,
+    fields: [(&str, Option<String>); N],
+) -> Value {
+    let mut ax = serde_json::Map::new();
+    if let Some(role) = role {
+        ax.insert("role".to_string(), json!(role));
+    }
+    if let Some(subrole) = subrole {
+        ax.insert("subrole".to_string(), json!(subrole));
+    }
+    for (field, value) in fields {
+        if let Some(value) = value {
+            ax.insert(field.to_string(), json!(value));
+        }
+    }
+    Value::Object(ax)
+}
+
+fn base_ax_selector_with_path(
+    role: &Option<String>,
+    subrole: &Option<String>,
+    path: Option<Value>,
+) -> Value {
+    let mut value = base_ax_selector(role, subrole, []);
+    if let Some(ax) = value.as_object_mut() {
+        if let Some(path) = path {
+            ax.insert("path".to_string(), path);
+        }
+    }
+    value
+}
+
+fn push_ax_candidate(
+    ranking: &mut Vec<Value>,
+    strategy: &str,
+    score: u64,
+    reason: &str,
+    ax: Value,
+) {
+    if ax == json!({}) {
+        return;
+    }
+
+    let candidate = json!({
+        "kind": "ax",
+        "strategy": strategy,
+        "score": score,
+        "reason": reason,
+        "ax": ax,
+    });
+
+    if !ranking.iter().any(|existing| existing == &candidate) {
+        ranking.push(candidate);
+    }
+}
+
+fn pointer_fallback(
+    payload: &serde_json::Map<String, Value>,
+    anchor_text: Option<&str>,
+    role: Option<&str>,
+) -> Option<Value> {
+    let x = payload.get("x").and_then(Value::as_f64)?;
+    let y = payload.get("y").and_then(Value::as_f64)?;
+
+    let mut spatial = serde_json::Map::new();
+    if let Some(text) = anchor_text.or(role) {
+        spatial.insert("anchorText".to_string(), json!(text));
+    }
+    spatial.insert(
+        "rect".to_string(),
+        json!({
+            "x": x,
+            "y": y,
+            "w": 1,
+            "h": 1,
+        }),
+    );
+
+    Some(json!({
+        "kind": "spatial",
+        "strategy": "pointer",
+        "score": 20,
+        "reason": "original pointer position from recorder snapshot",
+        "spatial": spatial,
+    }))
+}
+
 fn push_wait_for_element(steps: &mut Vec<Value>, selector: &Value) {
     steps.push(json!({
         "kind": "waitFor",
@@ -798,17 +1162,29 @@ fn flush_text_entry(context: &mut DraftContext) {
         return;
     };
 
-    if text_entry.value.is_empty() {
+    let selector = text_entry.selector;
+    let value = text_entry.value;
+
+    if value.is_empty() {
         return;
     }
 
+    let verification_selector = selector.clone();
+    let verification_value = value.clone();
     context.steps.push(json!({
         "kind": "setText",
-        "selector": text_entry.selector,
+        "selector": selector,
         "value": {
             "kind": "literal",
-            "value": text_entry.value,
+            "value": value,
         },
+        "verify": [{
+            "condition": {
+                "kind": "textEquals",
+                "selector": verification_selector,
+                "value": verification_value,
+            }
+        }],
     }));
 }
 
@@ -944,18 +1320,17 @@ mod tests {
             .expect("steps array should exist");
 
         assert_eq!(workflow.step_count, 5);
-        assert_eq!(
-            steps[0],
-            json!({ "kind": "focusWindow", "bundleId": "com.apple.TextEdit" })
-        );
+        assert_eq!(steps[0]["kind"], "focusWindow");
+        assert_eq!(steps[0]["bundleId"], "com.apple.TextEdit");
+        assert_eq!(steps[0]["verify"][0]["condition"]["kind"], "windowVisible");
         assert_eq!(steps[1]["kind"], "waitFor");
         assert_eq!(steps[2]["kind"], "click");
         assert_eq!(steps[3]["kind"], "setText");
         assert_eq!(steps[3]["value"]["value"], "hello");
-        assert_eq!(
-            steps[4],
-            json!({ "kind": "focusWindow", "bundleId": "com.apple.Safari" })
-        );
+        assert_eq!(steps[3]["verify"][0]["condition"]["kind"], "textEquals");
+        assert_eq!(steps[4]["kind"], "focusWindow");
+        assert_eq!(steps[4]["bundleId"], "com.apple.Safari");
+        assert_eq!(steps[4]["verify"][0]["condition"]["kind"], "windowVisible");
     }
 
     #[test]
@@ -1004,6 +1379,104 @@ mod tests {
     }
 
     #[test]
+    fn compiles_ranked_selector_candidates() {
+        let events = vec![
+            raw_event(
+                1,
+                0,
+                "ax_snapshot",
+                json!({
+                    "schemaVersion": 1,
+                    "payload": {
+                        "x": 320,
+                        "y": 180,
+                        "role": "AXButton",
+                        "subrole": "AXPushButton",
+                        "title": "Save",
+                        "description": "Save document",
+                        "identifier": "save-button",
+                        "selector": {
+                            "targetApp": { "bundleId": "com.apple.TextEdit" },
+                            "ax": {
+                                "role": "AXButton",
+                                "subrole": "AXPushButton",
+                                "title": "Save",
+                                "description": "Save document",
+                                "identifier": "save-button"
+                            }
+                        }
+                    }
+                }),
+            ),
+            raw_event(
+                2,
+                1,
+                "mouse_down",
+                json!({ "schemaVersion": 1, "payload": { "x": 320, "y": 180 } }),
+            ),
+        ];
+
+        let workflow = compile_workflow(12, "Selector ranking".to_string(), &events)
+            .expect("workflow should compile");
+        let selector = workflow.workflow["steps"][0]["condition"]["selector"].clone();
+
+        assert_eq!(selector["targetApp"]["bundleId"], "com.apple.TextEdit");
+        assert_eq!(selector["preferredStrategy"], "identifier");
+        assert_eq!(selector["ax"]["identifier"], "save-button");
+        assert_eq!(selector["ranking"][0]["strategy"], "identifier");
+        assert_eq!(selector["ranking"][1]["strategy"], "title");
+        assert_eq!(selector["fallbacks"][0]["strategy"], "title");
+        assert_eq!(selector["fallbacks"][1]["strategy"], "description");
+    }
+
+    #[test]
+    fn adds_pointer_fallback_for_weak_ax_surfaces() {
+        let events = vec![
+            raw_event(
+                1,
+                0,
+                "ax_snapshot",
+                json!({
+                    "schemaVersion": 1,
+                    "payload": {
+                        "x": 48,
+                        "y": 64,
+                        "role": "AXImage",
+                        "description": "Toolbar icon",
+                        "selector": {
+                            "targetApp": { "bundleId": "com.apple.Preview" },
+                            "ax": {
+                                "role": "AXImage",
+                                "description": "Toolbar icon"
+                            }
+                        }
+                    }
+                }),
+            ),
+            raw_event(
+                2,
+                1,
+                "mouse_down",
+                json!({ "schemaVersion": 1, "payload": { "x": 48, "y": 64 } }),
+            ),
+        ];
+
+        let workflow =
+            compile_workflow(13, "Weak AX".to_string(), &events).expect("workflow should compile");
+        let selector = workflow.workflow["steps"][0]["condition"]["selector"].clone();
+
+        assert_eq!(selector["preferredStrategy"], "description");
+        assert_eq!(selector["fallbacks"][0]["strategy"], "role");
+        assert_eq!(selector["fallbacks"][1]["kind"], "spatial");
+        assert_eq!(
+            selector["fallbacks"][1]["spatial"]["anchorText"],
+            "Toolbar icon"
+        );
+        assert_eq!(selector["fallbacks"][1]["spatial"]["rect"]["x"], 48.0);
+        assert_eq!(selector["fallbacks"][1]["spatial"]["rect"]["y"], 64.0);
+    }
+
+    #[test]
     fn executes_workflow_and_persists_run_logs() {
         let root = unique_test_dir();
         let storage =
@@ -1019,6 +1492,7 @@ mod tests {
         });
         let mut runner = MockRunner::new(vec![
             Ok(json!({ "action": "focusWindow" })),
+            Ok(json!({ "action": "waitFor", "conditionKind": "elementPresent" })),
             Ok(json!({ "action": "click" })),
         ]);
 
@@ -1027,7 +1501,7 @@ mod tests {
 
         assert_eq!(summary.status, "completed");
         assert_eq!(summary.completed_step_count, 3);
-        assert_eq!(runner.seen_kinds, vec!["focusWindow", "click"]);
+        assert_eq!(runner.seen_kinds, vec!["focusWindow", "waitFor", "click"]);
 
         let run = storage
             .get_workflow_run(summary.run_row_id)
@@ -1044,6 +1518,109 @@ mod tests {
             .any(|log| log.event_type == "step_attempt_started"));
         assert!(logs.iter().any(|log| log.event_type == "step_finished"));
         assert!(logs.iter().any(|log| log.event_type == "run_completed"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runs_post_action_verification_hooks() {
+        let root = unique_test_dir();
+        let storage =
+            Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
+        let workflow = json!({
+            "id": "wf_verify",
+            "name": "Verification Workflow",
+            "steps": [
+                {
+                    "kind": "setText",
+                    "selector": { "ax": { "role": "AXTextField", "title": "Name" } },
+                    "value": { "kind": "literal", "value": "Alice" },
+                    "verify": [{
+                        "condition": {
+                            "kind": "textEquals",
+                            "selector": { "ax": { "role": "AXTextField", "title": "Name" } },
+                            "value": "Alice"
+                        }
+                    }]
+                }
+            ]
+        });
+        let mut runner = MockRunner::new(vec![
+            Ok(json!({ "action": "setText", "value": "Alice" })),
+            Ok(json!({ "action": "assert", "conditionKind": "textEquals" })),
+        ]);
+
+        let summary = execute_workflow_with_runner(&storage, &mut runner, &workflow, None)
+            .expect("workflow should execute");
+
+        assert_eq!(summary.status, "completed");
+        assert_eq!(runner.seen_kinds, vec!["setText", "assert"]);
+
+        let logs = storage
+            .list_workflow_run_logs(summary.run_row_id, 20)
+            .expect("logs should load");
+        assert!(logs
+            .iter()
+            .any(|log| log.event_type == "step_verification_started"));
+        assert!(logs
+            .iter()
+            .any(|log| log.event_type == "step_verification_finished"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verification_failure_marks_step_failed() {
+        let root = unique_test_dir();
+        let storage =
+            Storage::bootstrap(root.join("storage.sqlite3")).expect("storage should bootstrap");
+        let workflow = json!({
+            "id": "wf_verify_fail",
+            "name": "Verification Failure",
+            "steps": [
+                {
+                    "kind": "setText",
+                    "selector": { "ax": { "role": "AXTextField", "title": "Name" } },
+                    "value": { "kind": "literal", "value": "Alice" },
+                    "verify": [{
+                        "condition": {
+                            "kind": "textEquals",
+                            "selector": { "ax": { "role": "AXTextField", "title": "Name" } },
+                            "value": "Alice"
+                        }
+                    }]
+                }
+            ]
+        });
+        let mut runner = MockRunner::new(vec![
+            Ok(json!({ "action": "setText", "value": "Alice" })),
+            Err(RunnerError::Remote {
+                code: "EXECUTION_FAILED".to_string(),
+                message: "expected value 'Alice' but found 'Bob'".to_string(),
+                retryable: false,
+            }),
+        ]);
+
+        let summary = execute_workflow_with_runner(&storage, &mut runner, &workflow, None)
+            .expect("workflow execution should return summary");
+
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.completed_step_count, 0);
+        assert_eq!(summary.failed_step_index, Some(0));
+        assert_eq!(runner.seen_kinds, vec!["setText", "assert"]);
+        assert!(summary
+            .last_error
+            .as_deref()
+            .expect("last error should exist")
+            .contains("expected value 'Alice' but found 'Bob'"));
+
+        let logs = storage
+            .list_workflow_run_logs(summary.run_row_id, 20)
+            .expect("logs should load");
+        assert!(logs
+            .iter()
+            .any(|log| log.event_type == "step_verification_finished"));
+        assert!(logs.iter().any(|log| log.event_type == "run_failed"));
 
         let _ = fs::remove_dir_all(&root);
     }

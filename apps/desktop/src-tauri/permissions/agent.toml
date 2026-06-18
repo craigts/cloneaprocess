@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-start-agent"
+description = "Enables the start_agent command without any pre-configured scope."
+commands.allow = ["start_agent"]
+
+[[permission]]
+identifier = "allow-stop-agent"
+description = "Enables the stop_agent command without any pre-configured scope."
+commands.allow = ["stop_agent"]

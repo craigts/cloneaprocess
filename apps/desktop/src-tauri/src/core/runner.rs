@@ -72,6 +72,7 @@ pub struct RunnerStepRequest {
     pub outer_run_id: String,
     pub step_index: usize,
     pub attempt: u32,
+    pub operation_label: String,
     pub step: Value,
 }
 
@@ -160,15 +161,15 @@ impl RunnerBridge {
 
     fn request_id(request: &RunnerStepRequest) -> String {
         format!(
-            "req_step_{}_attempt_{}",
-            request.step_index, request.attempt
+            "req_step_{}_attempt_{}_{}",
+            request.step_index, request.attempt, request.operation_label
         )
     }
 
     fn helper_run_id(request: &RunnerStepRequest) -> String {
         format!(
-            "{}_step_{}_attempt_{}",
-            request.outer_run_id, request.step_index, request.attempt
+            "{}_step_{}_attempt_{}_{}",
+            request.outer_run_id, request.step_index, request.attempt, request.operation_label
         )
     }
 
@@ -181,6 +182,73 @@ impl RunnerBridge {
             .collect::<Vec<_>>()
             .join(" | ")
     }
+
+    pub fn take_screenshot(&mut self, timeout: Duration) -> Result<ScreenshotResult, RunnerError> {
+        let request_id = format!("req_screenshot_{}", uuid_short());
+        let request_json = json!({
+            "id": request_id,
+            "type": "take_screenshot",
+            "payload": { "quality": 0.5 }
+        });
+
+        writeln!(self.stdin, "{}", request_json)?;
+        self.stdin.flush()?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RunnerError::Timeout {
+                    operation: "screenshot",
+                    stderr_tail: self.stderr_summary(),
+                });
+            }
+
+            match self.stdout_rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(line) => {
+                    let message: Value = serde_json::from_str(&line).map_err(|e| {
+                        RunnerError::InvalidProtocol(format!("invalid json from runner: {e}"))
+                    })?;
+
+                    if message.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                        continue;
+                    }
+
+                    if !message.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                        return Err(parse_reply_error(&message).unwrap_or_else(|| {
+                            RunnerError::InvalidProtocol("screenshot failed".to_string())
+                        }));
+                    }
+
+                    let payload = message.get("payload").cloned().unwrap_or_else(|| json!({}));
+                    return Ok(ScreenshotResult {
+                        base64: payload.get("base64").and_then(Value::as_str).unwrap_or("").to_string(),
+                        width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(status) = self.child.try_wait()? {
+                        return Err(RunnerError::Bridge(format!(
+                            "runner exited with status {}{}", status, format_stderr_suffix(&self.stderr_summary())
+                        )));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RunnerError::Bridge(format!(
+                        "runner stdout disconnected{}", format_stderr_suffix(&self.stderr_summary())
+                    )));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScreenshotResult {
+    pub base64: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl RunnerStepExecutor for RunnerBridge {
@@ -333,6 +401,17 @@ fn parse_error_payload(payload: Option<&Value>) -> Option<RunnerError> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+fn uuid_short() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    format!("{ts}_{n}")
 }
 
 fn format_stderr_suffix(stderr_tail: &str) -> String {

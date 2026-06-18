@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-check-permissions"
+description = "Enables the check_permissions command without any pre-configured scope."
+commands.allow = ["check_permissions"]
+
+[[permission]]
+identifier = "allow-open-system-settings-pane"
+description = "Enables the open_system_settings_pane command without any pre-configured scope."
+commands.allow = ["open_system_settings_pane"]
+
+[[permission]]
+identifier = "allow-restart-recorder-service"
+description = "Enables the restart_recorder_service command without any pre-configured scope."
+commands.allow = ["restart_recorder_service"]

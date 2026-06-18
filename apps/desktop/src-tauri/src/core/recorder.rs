@@ -92,7 +92,7 @@ pub enum RecorderTransportMode {
     XpcBundledService,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecorderTransportConfig {
     SubprocessBridge { binary_path: PathBuf },
     XpcMachService { service_name: String },
@@ -1031,13 +1031,20 @@ fn compact_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
+    use crate::commands::storage::load_keyframe_bytes;
+    use crate::storage::Storage;
+
     use super::{
         bridge_summary, push_bounded, BridgeDiagnostics, RecorderProtocolHandshake,
-        RecorderTransportConfig, RecorderTransportMode,
+        RecorderCoordinator, RecorderTransportConfig, RecorderTransportMode,
     };
 
     #[test]
@@ -1118,5 +1125,120 @@ mod tests {
         assert_eq!(bundled_transport.target(), "com.cloneaprocess.recorder");
         assert!(!bundled_transport.is_ready());
         assert!(bundled_transport.recorder_binary().is_empty());
+    }
+
+    #[test]
+    fn subprocess_smoke_test_persists_events_and_keyframe_bytes() {
+        let root = unique_test_dir("recorder-smoke");
+        let frame_dir = root.join("recordings").join("sess_smoke").join("frames");
+        fs::create_dir_all(&frame_dir).expect("frame directory should exist");
+
+        let frame_path = frame_dir.join("frm_smoke.jpg");
+        fs::write(&frame_path, b"jpeg-smoke").expect("frame bytes should write");
+
+        let helper_path = root.join("mock-recorder.sh");
+        write_mock_recorder_helper(&helper_path, &frame_path);
+
+        let storage =
+            Storage::bootstrap(root.join("storage").join("cloneaprocess.sqlite3"))
+                .expect("storage should bootstrap");
+        let mut coordinator = RecorderCoordinator::new(
+            storage.clone(),
+            RecorderTransportConfig::subprocess_bridge(helper_path),
+        );
+
+        let started = coordinator.start_capture().expect("capture should start");
+        assert!(started.active, "capture should report active");
+        assert_eq!(started.session_external_id.as_deref(), Some("sess_smoke"));
+
+        let stopped = coordinator.stop_capture().expect("capture should stop");
+        assert!(!stopped.active, "capture should report stopped");
+        assert_eq!(stopped.session_external_id.as_deref(), Some("sess_smoke"));
+        assert_eq!(stopped.event_count, 3);
+        assert_eq!(stopped.frame_count, 1);
+        assert_eq!(stopped.permissions.get("accessibility"), Some(&true));
+        assert_eq!(stopped.permissions.get("screenRecording"), Some(&true));
+
+        let sessions = storage.list_sessions(10).expect("sessions should load");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "completed");
+        assert_eq!(sessions[0].external_id, "sess_smoke");
+        assert_eq!(sessions[0].app_transition_count, 1);
+        assert_eq!(sessions[0].ax_snapshot_count, 1);
+        assert_eq!(sessions[0].keyframe_count_cached, 1);
+
+        let session_id = sessions[0].id;
+        let events = storage
+            .list_raw_events_for_session(session_id, 10)
+            .expect("events should load");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "frontmost_app_changed");
+        assert_eq!(events[1].event_type, "ax_snapshot");
+        assert_eq!(events[2].event_type, "screen_frame");
+
+        let keyframe_paths = storage
+            .list_keyframe_paths_for_session(session_id)
+            .expect("keyframe paths should load");
+        assert_eq!(keyframe_paths, vec![frame_path.display().to_string()]);
+
+        let rendered_bytes = load_keyframe_bytes(frame_path.display().to_string())
+            .expect("keyframe bytes should load");
+        assert_eq!(rendered_bytes, b"jpeg-smoke");
+
+        let screen_frame: serde_json::Value =
+            serde_json::from_str(&events[2].event_json).expect("screen frame event should parse");
+        assert_eq!(screen_frame["payload"]["path"], frame_path.display().to_string());
+        assert_eq!(screen_frame["payload"]["frameId"], "frm_smoke");
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), now));
+        fs::create_dir_all(&root).expect("test root should create");
+        root
+    }
+
+    fn write_mock_recorder_helper(helper_path: &PathBuf, frame_path: &PathBuf) {
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "--protocol-json" ]; then
+  printf '%s\n' '{{"protocol_version":1,"protocol_min":1,"capabilities":["event_stream","permissions","ax_snapshot","screen_frame"]}}'
+  exit 0
+fi
+
+if [ "$1" = "--permissions-json" ]; then
+  printf '%s\n' '{{"accessibility":true,"screenRecording":true}}'
+  exit 0
+fi
+
+if [ "$1" = "--bridge" ]; then
+  printf '%s\n' '{{"kind":"permissions","payload":{{"accessibility":true,"screenRecording":true}}}}'
+  printf '%s\n' '{{"kind":"capture_started","payload":{{"ok":true,"session_id":"sess_smoke","started_at":1234}}}}'
+  printf '%s\n' '{{"kind":"event","payload":{{"v":1,"id":"evt_1","ts":1235,"type":"frontmost_app_changed","payload":{{"bundle_id":"com.apple.TextEdit"}}}}}}'
+  printf '%s\n' '{{"kind":"event","payload":{{"v":1,"id":"evt_2","ts":1236,"type":"ax_snapshot","payload":{{"snapshot_id":"ax_1","role":"AXButton","title":"Save"}}}}}}'
+  printf '%s\n' '{{"kind":"event","payload":{{"schema_version":1,"event_id":"evt_3","recorded_at_ms":1237,"event_type":"screen_frame","payload":{{"frame_id":"frm_smoke","path":"{}"}}}}}}'
+  while IFS= read -r line; do
+    case "$line" in
+      *'"command":"stop"'*) exit 0 ;;
+    esac
+  done
+  exit 0
+fi
+
+exit 1
+"#,
+            frame_path.display()
+        );
+
+        fs::write(helper_path, script).expect("mock helper should write");
+        let mut permissions = fs::metadata(helper_path)
+            .expect("mock helper metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(helper_path, permissions)
+            .expect("mock helper should become executable");
     }
 }
