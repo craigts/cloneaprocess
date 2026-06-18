@@ -59,6 +59,30 @@ pub struct AgentConfig {
     pub cancel_token: Arc<AtomicBool>,
 }
 
+/// How to translate the coordinate space of the screenshot the model is currently looking at into
+/// global click coordinates: which display it was captured from (`origin`) and any downscaling
+/// (`point_scale`).
+#[derive(Clone, Copy)]
+struct View {
+    origin_x: f64,
+    origin_y: f64,
+    point_scale: f64,
+    width: u32,
+    height: u32,
+}
+
+impl View {
+    fn from_shot(shot: &crate::core::runner::ScreenshotResult) -> Self {
+        Self {
+            origin_x: shot.origin_x,
+            origin_y: shot.origin_y,
+            point_scale: shot.point_scale,
+            width: shot.width,
+            height: shot.height,
+        }
+    }
+}
+
 // ---- Agent loop ----
 
 pub fn run_agent<F>(
@@ -97,9 +121,11 @@ where
     let initial = runner.take_screenshot(SCREENSHOT_TIMEOUT)
         .map_err(|e| format!("initial screenshot failed: {e}"))?;
     eprintln!(
-        "[agent] display {}x{} logical points (backing scale {:.1}); clicks map 1:1",
-        initial.width, initial.height, initial.scale
+        "[agent] capture {}x{} at origin ({:.0}, {:.0}); backing scale {:.1}, point scale {:.2}",
+        initial.width, initial.height, initial.origin_x, initial.origin_y, initial.scale, initial.point_scale
     );
+    // The coordinate space of the screenshot the model will next react to.
+    let mut view = View::from_shot(&initial);
     emit(AgentEvent::Screenshot {
         step_number,
         base64: initial.base64.clone(),
@@ -107,7 +133,6 @@ where
         height: initial.height,
     });
 
-    let tools = tool_definitions(initial.width, initial.height);
     let system_prompt = build_system_prompt();
 
     // Seed the conversation with the task, the recording walkthrough, and the live screen.
@@ -138,6 +163,9 @@ where
 
         emit(AgentEvent::Thinking { step_number });
 
+        // Declare the tool's display size to match the screenshot the model is acting on — capture
+        // can follow the active window to a differently-sized display between turns.
+        let tools = tool_definitions(view.width, view.height);
         let api_result = runtime.block_on(call_claude(
             &config.api_key,
             &system_prompt,
@@ -172,6 +200,9 @@ where
         }
 
         let mut tool_results: Vec<Value> = Vec::new();
+        // All actions in this assistant turn were decided from the same screenshot, so they share
+        // its coordinate space. `view` may advance as we capture results for the *next* turn.
+        let turn_view = view;
 
         for tool_call in tool_uses {
             let tool_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -186,12 +217,14 @@ where
                 params: input.clone(),
             });
 
-            let exec = execute_computer_action(&mut runner, &action, &input);
+            let exec = execute_computer_action(&mut runner, &action, &input, &turn_view);
 
-            // Let the UI settle, then capture the result so the model sees the consequence.
+            // Let the UI settle, then capture the result so the model sees the consequence. The
+            // capture may be on a different display now (focus moved), so advance `view` to it.
             std::thread::sleep(Duration::from_millis(ACTION_SETTLE_MS));
             let shot = runner.take_screenshot(SCREENSHOT_TIMEOUT).ok();
             if let Some(s) = &shot {
+                view = View::from_shot(s);
                 emit(AgentEvent::Screenshot {
                     step_number,
                     base64: s.base64.clone(),
@@ -238,41 +271,53 @@ where
 
 // ---- Tool execution ----
 
-fn execute_computer_action(runner: &mut RunnerBridge, action: &str, input: &Value) -> Result<(), String> {
+fn execute_computer_action(
+    runner: &mut RunnerBridge,
+    action: &str,
+    input: &Value,
+    view: &View,
+) -> Result<(), String> {
     // `screenshot` and `cursor_position` need no runner step — the screenshot we take after every
     // action is the feedback the model is asking for.
     if action == "screenshot" || action == "cursor_position" {
         return Ok(());
     }
 
+    // Map a coordinate from the screenshot the model saw into the global click space, accounting
+    // for which display was captured and any downscaling.
+    let map = |input: &Value, key: &str| -> Result<(f64, f64), String> {
+        let (mx, my) = coordinate(input, key)?;
+        Ok((view.origin_x + mx * view.point_scale, view.origin_y + my * view.point_scale))
+    };
+
     let step_json = match action {
         "left_click" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 1, "modifiers": modifiers_from_text(input)})
         }
         "right_click" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             json!({"kind": "clickAt", "x": x, "y": y, "button": "right", "clickCount": 1, "modifiers": modifiers_from_text(input)})
         }
         "middle_click" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             json!({"kind": "clickAt", "x": x, "y": y, "button": "middle", "clickCount": 1, "modifiers": modifiers_from_text(input)})
         }
         "double_click" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 2, "modifiers": modifiers_from_text(input)})
         }
         "triple_click" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 3, "modifiers": modifiers_from_text(input)})
         }
         "mouse_move" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             json!({"kind": "moveMouse", "x": x, "y": y})
         }
         "left_click_drag" => {
-            let (fx, fy) = coordinate(input, "start_coordinate")?;
-            let (tx, ty) = coordinate(input, "coordinate")?;
+            let (fx, fy) = map(input, "start_coordinate")?;
+            let (tx, ty) = map(input, "coordinate")?;
             json!({"kind": "drag", "fromX": fx, "fromY": fy, "toX": tx, "toY": ty})
         }
         "type" => {
@@ -290,7 +335,7 @@ fn execute_computer_action(runner: &mut RunnerBridge, action: &str, input: &Valu
             json!({"kind": "keyPress", "key": key, "modifiers": modifiers})
         }
         "scroll" => {
-            let (x, y) = coordinate(input, "coordinate")?;
+            let (x, y) = map(input, "coordinate")?;
             let direction = input.get("scroll_direction").and_then(Value::as_str).unwrap_or("down");
             let amount = input.get("scroll_amount").and_then(Value::as_i64).unwrap_or(3);
             json!({"kind": "scroll", "x": x, "y": y, "direction": direction, "amount": amount, "modifiers": modifiers_from_text(input)})
@@ -566,6 +611,7 @@ You have been shown a recording of the user performing this task manually. Use i
 RULES:
 - Take ONE action at a time, then look at the resulting screenshot before deciding the next action.
 - Coordinates are in the screenshot's pixel space; click precisely on the element you can see.
+- The screenshot shows the display that currently holds the active window. The user may have multiple monitors, so when you switch or open an app the view may "jump" to a different screen — that is expected; just work with whatever the latest screenshot shows.
 - After navigating or opening something, use the `wait` action to let the UI load before acting.
 - Prefer keyboard shortcuts where they are reliable (e.g. cmd+t new tab, cmd+l address bar, cmd+c/cmd+v).
 - To type into a field, click it first, then use the `type` action.

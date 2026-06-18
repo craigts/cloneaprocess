@@ -226,6 +226,9 @@ impl RunnerBridge {
                         width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
                         height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
                         scale: payload.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
+                        origin_x: payload.get("originX").and_then(Value::as_f64).unwrap_or(0.0),
+                        origin_y: payload.get("originY").and_then(Value::as_f64).unwrap_or(0.0),
+                        point_scale: payload.get("pointScale").and_then(Value::as_f64).unwrap_or(1.0),
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -254,6 +257,13 @@ pub struct ScreenshotResult {
     pub height: u32,
     /// Backing scale factor of the captured display (physical pixels / logical points).
     pub scale: f64,
+    /// Global top-left of the captured display, in points. Added to image coordinates (after
+    /// `point_scale`) to get global click coordinates — lets capture follow a secondary display.
+    pub origin_x: f64,
+    pub origin_y: f64,
+    /// Logical points per image pixel (1.0 unless the image was capped below the display's
+    /// logical size). `global = origin + image_coord * point_scale`.
+    pub point_scale: f64,
 }
 
 impl RunnerStepExecutor for RunnerBridge {

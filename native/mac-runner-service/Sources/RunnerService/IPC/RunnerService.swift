@@ -1015,38 +1015,58 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 
     func takeScreenshot(quality: Double) throws -> [String: Any] {
         #if canImport(ApplicationServices) && canImport(ImageIO) && canImport(UniformTypeIdentifiers)
-        let displayID = CGMainDisplayID()
+        // Capture follows whichever display currently holds the active window, so the agent can
+        // see and click windows on secondary displays (not just the main one). Falls back to the
+        // main display on any failure.
+        let displayID = Self.activeDisplayID()
         guard let captured = CGDisplayCreateImage(displayID) else {
             throw RunnerServiceError.executionFailed("failed to capture screenshot")
         }
 
-        // CGDisplayCreateImage returns the frame buffer in *physical pixels* (e.g. 2880x1800
-        // on a Retina display), but mouse events in `clickAt` are posted in *logical points*
-        // (e.g. 1440x900). If we hand the model a physical-pixel image, every coordinate it
-        // returns is off by the display's backing scale factor. Downscale to logical points
-        // so the image the model sees shares the coordinate space we click in 1:1.
-        let pointWidth: Int
-        let pointHeight: Int
+        // The captured display's global top-left, in points. The caller adds this origin to the
+        // model's image coordinates to get global click coordinates (which is how `clickAt`'s
+        // CGEvents are addressed), so clicks land on the correct display.
+        let bounds = CGDisplayBounds(displayID)
+
+        // CGDisplayCreateImage returns physical pixels (e.g. 2880x1800 on Retina) while mouse
+        // events are posted in logical points (1440x900). Downscale to logical points — and cap
+        // the long edge so we stay within the vision API's resolution limit. `pointScale` is the
+        // logical-points-per-image-pixel factor the caller needs to map coordinates back.
+        let logicalWidth: Int
+        let logicalHeight: Int
         if let mode = CGDisplayCopyDisplayMode(displayID), mode.width > 0, mode.height > 0 {
-            pointWidth = mode.width
-            pointHeight = mode.height
+            logicalWidth = mode.width
+            logicalHeight = mode.height
         } else {
-            // Fall back to the captured size (assume non-Retina / 1x) if the mode is unavailable.
-            pointWidth = captured.width
-            pointHeight = captured.height
+            logicalWidth = captured.width
+            logicalHeight = captured.height
+        }
+
+        let maxEdge = 2560
+        let longEdge = max(logicalWidth, logicalHeight)
+        let imageWidth: Int
+        let imageHeight: Int
+        if longEdge > maxEdge {
+            let factor = Double(maxEdge) / Double(longEdge)
+            imageWidth = max(1, Int((Double(logicalWidth) * factor).rounded()))
+            imageHeight = max(1, Int((Double(logicalHeight) * factor).rounded()))
+        } else {
+            imageWidth = logicalWidth
+            imageHeight = logicalHeight
         }
 
         let image: CGImage
-        if captured.width != pointWidth || captured.height != pointHeight {
-            guard let resized = Self.resize(captured, toWidth: pointWidth, toHeight: pointHeight) else {
-                throw RunnerServiceError.executionFailed("failed to downscale screenshot to logical points")
+        if captured.width != imageWidth || captured.height != imageHeight {
+            guard let resized = Self.resize(captured, toWidth: imageWidth, toHeight: imageHeight) else {
+                throw RunnerServiceError.executionFailed("failed to downscale screenshot")
             }
             image = resized
         } else {
             image = captured
         }
 
-        let scale = pointWidth > 0 ? Double(captured.width) / Double(pointWidth) : 1.0
+        let pointScale = imageWidth > 0 ? Double(logicalWidth) / Double(imageWidth) : 1.0
+        let backingScale = logicalWidth > 0 ? Double(captured.width) / Double(logicalWidth) : 1.0
 
         let data = NSMutableData()
         let jpegType = UTType.jpeg.identifier as CFString
@@ -1062,14 +1082,16 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 
         let base64 = (data as Data).base64EncodedString()
 
-        // `width`/`height` are reported in logical points so the model's coordinates map
-        // directly onto `clickAt`. `scale` and the raw pixel dims are included for diagnostics.
+        // Global click coordinate = (originX + imageX * pointScale, originY + imageY * pointScale).
         return [
             "action": "screenshot",
             "base64": base64,
             "width": image.width,
             "height": image.height,
-            "scale": scale,
+            "originX": Double(bounds.origin.x),
+            "originY": Double(bounds.origin.y),
+            "pointScale": pointScale,
+            "scale": backingScale,
             "pixelWidth": captured.width,
             "pixelHeight": captured.height,
             "format": "jpeg",
@@ -1080,7 +1102,57 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
     }
 
     #if canImport(ApplicationServices)
-    /// Downscales a captured frame to the target logical-point dimensions.
+    /// The display that currently holds the frontmost app's main (or focused) window, so capture
+    /// follows the active window across monitors. Falls back to the main display on any failure.
+    private static func activeDisplayID() -> CGDirectDisplayID {
+        #if canImport(AppKit)
+        guard let app = NSWorkspace.shared.frontmostApplication else { return CGMainDisplayID() }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+
+        var windowRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &windowRef) != .success
+            || windowRef == nil {
+            if AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef) != .success {
+                return CGMainDisplayID()
+            }
+        }
+        guard let ref = windowRef else { return CGMainDisplayID() }
+        let window = ref as! AXUIElement
+        guard let frame = Self.windowFrame(window) else { return CGMainDisplayID() }
+
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        var displays = [CGDirectDisplayID](repeating: 0, count: 1)
+        var matching: UInt32 = 0
+        if CGGetDisplaysWithPoint(center, 1, &displays, &matching) == .success, matching > 0, displays[0] != 0 {
+            return displays[0]
+        }
+        return CGMainDisplayID()
+        #else
+        return CGMainDisplayID()
+        #endif
+    }
+
+    #if canImport(AppKit)
+    /// Reads an AX window's frame (position + size) in global screen points.
+    private static func windowFrame(_ window: AXUIElement) -> CGRect? {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posValue = posRef, let sizeValue = sizeRef else {
+            return nil
+        }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posValue as! AXValue, .cgPoint, &point),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+            return nil
+        }
+        return CGRect(origin: point, size: size)
+    }
+    #endif
+
+    /// Downscales a captured frame to the target dimensions.
     private static func resize(_ image: CGImage, toWidth width: Int, toHeight height: Int) -> CGImage? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
