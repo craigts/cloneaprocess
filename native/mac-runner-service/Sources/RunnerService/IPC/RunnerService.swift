@@ -1259,6 +1259,15 @@ private func keyCodeForName(_ name: String) -> CGKeyCode? {
     case "page_down", "pagedown", "next": return 121
     case "minus": return 27
     case "equal", "equals": return 24
+    case "slash": return 44
+    case "period", "dot": return 47
+    case "comma": return 43
+    case "semicolon": return 41
+    case "quote", "apostrophe": return 39
+    case "backslash": return 42
+    case "leftbracket", "left_bracket": return 33
+    case "rightbracket", "right_bracket": return 30
+    case "grave", "backtick": return 50
     case "f1": return 122
     case "f2": return 120
     case "f3": return 99
