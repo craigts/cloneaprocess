@@ -456,6 +456,12 @@ fn describe_step(step: &Value) -> String {
     let num = |k: &str| step.get(k).and_then(Value::as_f64).unwrap_or(0.0);
     match kind {
         "clickAt" => format!("click at ({:.0}, {:.0})", num("x"), num("y")),
+        "clickElement" => {
+            let label = step.get("selector").and_then(|s| s.get("ax"))
+                .and_then(|a| a.get("title").or_else(|| a.get("identifier")))
+                .and_then(Value::as_str).unwrap_or("element");
+            format!("click \"{label}\"")
+        }
         "moveMouse" => format!("move to ({:.0}, {:.0})", num("x"), num("y")),
         "typeText" => format!("type \"{}\"", step.get("text").and_then(Value::as_str).unwrap_or("")),
         "keyPress" => format!("press {}", step.get("key").and_then(Value::as_str).unwrap_or("")),
@@ -491,27 +497,23 @@ fn execute_computer_action(
         Ok((view.origin_x + mx * view.point_scale, view.origin_y + my * view.point_scale))
     };
 
+    // Click family: execute at the vision-chosen point, but capture an AX selector (when the
+    // element is specifically identifiable) so the recorded step replays by element — robust to
+    // layout shifts — with the coordinate as a fallback.
+    if let Some((button, click_count)) = click_button_count(action) {
+        let (x, y) = map(input, "coordinate")?;
+        let modifiers = modifiers_from_text(input);
+        let selector = specific_selector(runner, x, y);
+        let exec_step = json!({"kind": "clickAt", "x": x, "y": y, "button": button, "clickCount": click_count, "modifiers": modifiers});
+        run_step(runner, action, &exec_step)?;
+        let record = match selector {
+            Some(sel) => json!({"kind": "clickElement", "selector": sel, "x": x, "y": y, "button": button, "clickCount": click_count, "modifiers": modifiers}),
+            None => exec_step,
+        };
+        return Ok(Some(record));
+    }
+
     let step_json = match action {
-        "left_click" => {
-            let (x, y) = map(input, "coordinate")?;
-            json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 1, "modifiers": modifiers_from_text(input)})
-        }
-        "right_click" => {
-            let (x, y) = map(input, "coordinate")?;
-            json!({"kind": "clickAt", "x": x, "y": y, "button": "right", "clickCount": 1, "modifiers": modifiers_from_text(input)})
-        }
-        "middle_click" => {
-            let (x, y) = map(input, "coordinate")?;
-            json!({"kind": "clickAt", "x": x, "y": y, "button": "middle", "clickCount": 1, "modifiers": modifiers_from_text(input)})
-        }
-        "double_click" => {
-            let (x, y) = map(input, "coordinate")?;
-            json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 2, "modifiers": modifiers_from_text(input)})
-        }
-        "triple_click" => {
-            let (x, y) = map(input, "coordinate")?;
-            json!({"kind": "clickAt", "x": x, "y": y, "button": "left", "clickCount": 3, "modifiers": modifiers_from_text(input)})
-        }
         "mouse_move" => {
             let (x, y) = map(input, "coordinate")?;
             json!({"kind": "moveMouse", "x": x, "y": y})
@@ -558,17 +560,59 @@ fn execute_computer_action(
         other => return Err(format!("unsupported computer action: {other}")),
     };
 
+    run_step(runner, action, &step_json)?;
+    Ok(Some(step_json))
+}
+
+/// Button + click count for the click-family computer actions; `None` for non-click actions.
+fn click_button_count(action: &str) -> Option<(&'static str, u32)> {
+    match action {
+        "left_click" => Some(("left", 1)),
+        "right_click" => Some(("right", 1)),
+        "middle_click" => Some(("middle", 1)),
+        "double_click" => Some(("left", 2)),
+        "triple_click" => Some(("left", 3)),
+        _ => None,
+    }
+}
+
+/// Queries the AX element at a global point and returns a selector — but only when the element is
+/// specifically identifiable (has a title or identifier), not a bare container like AXScrollArea.
+/// Returns `None` so the caller keeps a plain coordinate click for opaque/unlabeled elements.
+fn specific_selector(runner: &mut RunnerBridge, x: f64, y: f64) -> Option<Value> {
+    let info = runner.describe_element_at(x, y, ACTION_TIMEOUT).ok()?;
+    if info.get("found").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let title = info.get("title").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let identifier = info.get("identifier").and_then(Value::as_str).filter(|s| !s.is_empty());
+    if title.is_none() && identifier.is_none() {
+        return None;
+    }
+    let mut ax = serde_json::Map::new();
+    if let Some(role) = info.get("role").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        ax.insert("role".to_string(), json!(role));
+    }
+    if let Some(t) = title {
+        ax.insert("title".to_string(), json!(t));
+    }
+    if let Some(id) = identifier {
+        ax.insert("identifier".to_string(), json!(id));
+    }
+    Some(json!({ "ax": Value::Object(ax) }))
+}
+
+fn run_step(runner: &mut RunnerBridge, label: &str, step: &Value) -> Result<(), String> {
     let request = RunnerStepRequest {
         workflow_id: "agent".to_string(),
         outer_run_id: "agent_run".to_string(),
         step_index: 0,
         attempt: 1,
-        operation_label: action.to_string(),
-        step: step_json.clone(),
+        operation_label: label.to_string(),
+        step: step.clone(),
     };
-
     runner.execute_step(&request, ACTION_TIMEOUT)
-        .map(|_: crate::core::runner::RunnerStepResult| Some(step_json))
+        .map(|_: crate::core::runner::RunnerStepResult| ())
         .map_err(|e: crate::core::runner::RunnerError| e.to_string())
 }
 

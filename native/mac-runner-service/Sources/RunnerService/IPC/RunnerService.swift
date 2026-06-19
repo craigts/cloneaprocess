@@ -36,6 +36,11 @@ protocol RunnerActionPerforming {
     func clickAt(x: Double, y: Double, button: String) throws -> [String: Any]
     // Computer-use clicking: multi-click (double/triple) and held modifiers (shift/cmd-click).
     func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any]
+    // Describes the accessibility element at a global point (for capturing replayable selectors).
+    func describeElementAt(x: Double, y: Double) throws -> [String: Any]
+    // Clicks an element resolved by selector (drift-resistant), falling back to (x, y) if it no
+    // longer matches. Backs replay of captured click steps.
+    func clickElement(selector: [String: Any], x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
     func setTextFocused(value: String) throws -> [String: Any]
     // Types a literal string as real keystrokes into the focused element (reliable in browsers,
@@ -59,6 +64,12 @@ protocol RunnerActionPerforming {
 extension RunnerActionPerforming {
     func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
         try clickAt(x: x, y: y, button: button)
+    }
+    func describeElementAt(x: Double, y: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("describeElementAt is not supported by this performer")
+    }
+    func clickElement(selector: [String: Any], x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
+        try clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
     }
     func typeText(text: String) throws -> [String: Any] {
         throw RunnerServiceError.unsupportedStep("typeText is not supported by this performer")
@@ -145,6 +156,11 @@ final class RunnerBridgeSession {
                 let height = (payload["height"] as? NSNumber)?.doubleValue ?? 0
                 let quality = (payload["quality"] as? NSNumber)?.doubleValue ?? 0.7
                 let result = try performer.zoomCapture(x: x, y: y, width: width, height: height, quality: quality)
+                return [serializeReply(id: requestId, ok: true, payload: result)]
+            case "describe_element_at":
+                let x = (payload["x"] as? NSNumber)?.doubleValue ?? 0
+                let y = (payload["y"] as? NSNumber)?.doubleValue ?? 0
+                let result = try performer.describeElementAt(x: x, y: y)
                 return [serializeReply(id: requestId, ok: true, payload: result)]
             case "abort_run":
                 return [
@@ -281,6 +297,16 @@ final class RunnerBridgeSession {
             let clickCount = (step["clickCount"] as? NSNumber)?.intValue ?? 1
             let modifiers = step["modifiers"] as? [String] ?? []
             return try performer.clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
+        case "clickElement":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("clickElement step requires x and y fallback coordinates")
+            }
+            let selector = step["selector"] as? [String: Any] ?? [:]
+            let button = step["button"] as? String ?? "left"
+            let clickCount = (step["clickCount"] as? NSNumber)?.intValue ?? 1
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.clickElement(selector: selector, x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
         case "rightClickAt":
             guard let x = (step["x"] as? NSNumber)?.doubleValue,
                   let y = (step["y"] as? NSNumber)?.doubleValue else {
@@ -547,6 +573,68 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         throw RunnerServiceError.executionFailed("clickAt is only available on macOS")
         #endif
     }
+
+    func describeElementAt(x: Double, y: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard AXIsProcessTrusted() else {
+            throw RunnerServiceError.executionFailed("Accessibility permission is required")
+        }
+        let systemWide = AXUIElementCreateSystemWide()
+        var elementRef: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(systemWide, Float(x), Float(y), &elementRef)
+        guard result == .success, let element = elementRef else {
+            return ["found": false]
+        }
+
+        var info: [String: Any] = ["found": true]
+        if let role = attributeString(kAXRoleAttribute as CFString, element: element) { info["role"] = role }
+        if let subrole = attributeString(kAXSubroleAttribute as CFString, element: element) { info["subrole"] = subrole }
+        if let title = attributeString(kAXTitleAttribute as CFString, element: element), !title.isEmpty { info["title"] = title }
+        if let identifier = attributeString(kAXIdentifierAttribute as CFString, element: element), !identifier.isEmpty { info["identifier"] = identifier }
+        if let description = attributeString(kAXDescriptionAttribute as CFString, element: element), !description.isEmpty { info["description"] = description }
+        return info
+        #else
+        throw RunnerServiceError.executionFailed("describeElementAt is only available on macOS")
+        #endif
+    }
+
+    func clickElement(selector: [String: Any], x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        // Prefer the element: if the selector still resolves, click its current center so the click
+        // follows the element even if the layout shifted. Otherwise fall back to the captured point.
+        if let element = try? resolveElement(selector: selector), let center = Self.elementCenter(element) {
+            var result = try clickAt(x: center.x, y: center.y, button: button, clickCount: clickCount, modifiers: modifiers)
+            result["resolvedBy"] = "selector"
+            return result
+        }
+        var result = try clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
+        result["resolvedBy"] = "coordinate"
+        return result
+        #else
+        throw RunnerServiceError.executionFailed("clickElement is only available on macOS")
+        #endif
+    }
+
+    #if canImport(ApplicationServices)
+    /// Center of an AX element in global points, from its AXPosition + AXSize.
+    private static func elementCenter(_ element: AXUIElement) -> CGPoint? {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posValue = posRef, let sizeValue = sizeRef else {
+            return nil
+        }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posValue as! AXValue, .cgPoint, &point),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
+              size.width > 0, size.height > 0 else {
+            return nil
+        }
+        return CGPoint(x: point.x + size.width / 2, y: point.y + size.height / 2)
+    }
+    #endif
 
     func moveMouse(x: Double, y: Double) throws -> [String: Any] {
         #if canImport(ApplicationServices)

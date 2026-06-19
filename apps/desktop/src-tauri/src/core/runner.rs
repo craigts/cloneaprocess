@@ -219,6 +219,38 @@ impl RunnerBridge {
         timeout: Duration,
         operation: &'static str,
     ) -> Result<ScreenshotResult, RunnerError> {
+        let payload = self.request_payload(request_id, request_json, timeout, operation)?;
+        Ok(ScreenshotResult {
+            base64: payload.get("base64").and_then(Value::as_str).unwrap_or("").to_string(),
+            width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
+            height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
+            scale: payload.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
+            origin_x: payload.get("originX").and_then(Value::as_f64).unwrap_or(0.0),
+            origin_y: payload.get("originY").and_then(Value::as_f64).unwrap_or(0.0),
+            point_scale: payload.get("pointScale").and_then(Value::as_f64).unwrap_or(1.0),
+        })
+    }
+
+    /// Describes the accessibility element at a global point — used to capture a replayable
+    /// selector for a click. Returns the runner's payload (e.g. `{found, role, title, ...}`).
+    pub fn describe_element_at(&mut self, x: f64, y: f64, timeout: Duration) -> Result<Value, RunnerError> {
+        let request_id = format!("req_describe_{}", uuid_short());
+        let request_json = json!({
+            "id": request_id,
+            "type": "describe_element_at",
+            "payload": { "x": x, "y": y }
+        });
+        self.request_payload(&request_id, &request_json, timeout, "describe_element")
+    }
+
+    /// Sends a request and returns the reply's `payload` object.
+    fn request_payload(
+        &mut self,
+        request_id: &str,
+        request_json: &Value,
+        timeout: Duration,
+        operation: &'static str,
+    ) -> Result<Value, RunnerError> {
         writeln!(self.stdin, "{}", request_json)?;
         self.stdin.flush()?;
 
@@ -248,16 +280,7 @@ impl RunnerBridge {
                         }));
                     }
 
-                    let payload = message.get("payload").cloned().unwrap_or_else(|| json!({}));
-                    return Ok(ScreenshotResult {
-                        base64: payload.get("base64").and_then(Value::as_str).unwrap_or("").to_string(),
-                        width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        scale: payload.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
-                        origin_x: payload.get("originX").and_then(Value::as_f64).unwrap_or(0.0),
-                        origin_y: payload.get("originY").and_then(Value::as_f64).unwrap_or(0.0),
-                        point_scale: payload.get("pointScale").and_then(Value::as_f64).unwrap_or(1.0),
-                    });
+                    return Ok(message.get("payload").cloned().unwrap_or_else(|| json!({})));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(status) = self.child.try_wait()? {
