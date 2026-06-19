@@ -549,12 +549,24 @@ fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -
                 }
             }
             "key_down" => {
-                let code = payload.get("key_code").and_then(Value::as_i64).unwrap_or(-1);
-                match keycode_to_char(code) {
-                    Some('\n') => flush_typed(&mut steps, &mut typed_buffer), // Return ends a field
-                    Some('\u{8}') => { typed_buffer.pop(); }                  // Backspace
-                    Some(c) => typed_buffer.push(c),
-                    None => {} // modifier / unmapped key — ignored for text reconstruction
+                // Normalized events use camelCase (`keyCode`); accept snake_case too for safety.
+                let code = payload.get("keyCode").or_else(|| payload.get("key_code"))
+                    .and_then(Value::as_i64).unwrap_or(-1);
+                match code {
+                    36 => { // Return — submits the field; surface it so the agent knows to confirm
+                        flush_typed(&mut steps, &mut typed_buffer);
+                        steps.push("Pressed Return".to_string());
+                    }
+                    48 => { // Tab — e.g. accepting a slash-command autocomplete
+                        flush_typed(&mut steps, &mut typed_buffer);
+                        steps.push("Pressed Tab".to_string());
+                    }
+                    53 => { // Escape
+                        flush_typed(&mut steps, &mut typed_buffer);
+                        steps.push("Pressed Escape".to_string());
+                    }
+                    51 => { typed_buffer.pop(); } // Backspace
+                    _ => if let Some(c) = keycode_to_char(code) { typed_buffer.push(c); }
                 }
             }
             _ => {}
@@ -581,9 +593,10 @@ fn build_recording_summary(session: &SessionRecord, events: &[RawEventRecord]) -
     )
 }
 
-/// Maps a macOS virtual keycode to the character it produces on a US layout (unshifted). Used to
-/// reconstruct typed text from recorded key events, which capture only the keycode. Returns '\n'
-/// for Return and '\u{8}' for Delete/Backspace; None for modifiers and unmapped keys.
+/// Maps a macOS virtual keycode to the printable character it produces on a US layout (unshifted).
+/// Used to reconstruct typed text from recorded key events, which capture only the keycode.
+/// Returns None for modifiers and non-printable keys (Return/Tab/Escape/Delete are handled by the
+/// caller).
 fn keycode_to_char(code: i64) -> Option<char> {
     let c = match code {
         0 => 'a', 1 => 's', 2 => 'd', 3 => 'f', 4 => 'h', 5 => 'g', 6 => 'z', 7 => 'x',
@@ -595,8 +608,6 @@ fn keycode_to_char(code: i64) -> Option<char> {
         27 => '-', 24 => '=', 33 => '[', 30 => ']', 42 => '\\', 41 => ';', 39 => '\'',
         43 => ',', 47 => '.', 44 => '/', 50 => '`',
         49 => ' ',
-        36 => '\n',    // Return
-        51 => '\u{8}', // Delete / Backspace
         _ => return None,
     };
     Some(c)
@@ -758,4 +769,63 @@ async fn call_claude(
         input_tokens: parsed.usage.as_ref().and_then(|u| u.input_tokens).unwrap_or(0),
         output_tokens: parsed.usage.as_ref().and_then(|u| u.output_tokens).unwrap_or(0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{RawEventRecord, SessionRecord};
+
+    fn session(description: &str) -> SessionRecord {
+        SessionRecord {
+            id: 1,
+            external_id: "sess_test".to_string(),
+            label: None,
+            description: Some(description.to_string()),
+            started_at_ms: 0,
+            ended_at_ms: None,
+            status: "completed".to_string(),
+            app_transition_count: 0,
+            ax_snapshot_count: 0,
+            keyframe_count_cached: 0,
+            last_error: None,
+            created_at_ms: 0,
+        }
+    }
+
+    fn key_event(seq: i64, key_code: i64) -> RawEventRecord {
+        RawEventRecord {
+            id: seq,
+            session_id: 1,
+            sequence: seq,
+            event_type: "key_down".to_string(),
+            event_json: format!(
+                r#"{{"type":"key_down","payload":{{"keyCode":{key_code},"x":0,"y":0}}}}"#
+            ),
+            recorded_at_ms: 0,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn reconstructs_typed_text_from_camelcase_keycode() {
+        // "/remot" then Tab then Return — the slash-command autocomplete + submit flow.
+        let codes = [44, 15, 14, 46, 31, 17, 48, 36];
+        let events: Vec<RawEventRecord> = codes.iter().enumerate()
+            .map(|(i, &c)| key_event(i as i64, c))
+            .collect();
+
+        let summary = build_recording_summary(&session("turn on remote control"), &events);
+        assert!(summary.contains("Typed \"/remot\""), "summary was: {summary}");
+        assert!(summary.contains("Pressed Tab"), "summary was: {summary}");
+        assert!(summary.contains("Pressed Return"), "summary was: {summary}");
+    }
+
+    #[test]
+    fn keycode_map_covers_command_characters() {
+        assert_eq!(keycode_to_char(44), Some('/'));
+        assert_eq!(keycode_to_char(27), Some('-'));
+        assert_eq!(keycode_to_char(15), Some('r'));
+        assert_eq!(keycode_to_char(58), None); // modifier → not printable
+    }
 }
