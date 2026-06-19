@@ -168,11 +168,15 @@ where
 
     loop {
         if config.cancel_token.load(Ordering::Relaxed) {
+            // Save what was done so far — a cancelled-when-done run is still replayable.
+            save_script(storage, config.session_id, &task, &captured_steps);
             emit(AgentEvent::Cancelled { step_number });
             return Ok(());
         }
 
         if step_number >= max_steps {
+            // Hitting the cap still leaves a useful (if partial) script to replay/extend.
+            save_script(storage, config.session_id, &task, &captured_steps);
             emit(AgentEvent::Failed {
                 step_number,
                 error: format!("reached maximum step limit ({max_steps})"),

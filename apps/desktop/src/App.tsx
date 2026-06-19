@@ -424,16 +424,18 @@ export function App() {
           setAgentRunning(false)
           setAgentStatus('Done')
           setAgentResult(e.summary)
-          setScriptAvailable(true) // a replayable script was just captured
+          void refreshScriptAvailability() // a run that did work captures a replayable script
           break
         case 'failed':
           setAgentRunning(false)
           setAgentStatus('Failed')
           setAgentError(e.error)
+          void refreshScriptAvailability() // partial runs (cap/cancel) still save what they did
           break
         case 'cancelled':
           setAgentRunning(false)
           setAgentStatus('Cancelled')
+          void refreshScriptAvailability()
           break
       }
     })
@@ -484,6 +486,15 @@ export function App() {
 
   async function handleStopAgent() {
     try { await invoke('stop_agent') } catch {}
+  }
+
+  async function refreshScriptAvailability() {
+    try {
+      const exists = await invoke<boolean>('agent_script_exists', { sessionId: selectedSessionId ?? null })
+      setScriptAvailable(!!exists)
+    } catch {
+      setScriptAvailable(false)
+    }
   }
 
   // Whether a replay script exists for the current selection (refreshed on session change).
