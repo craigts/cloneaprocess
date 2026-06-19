@@ -25,6 +25,7 @@ const MAX_RESPONSE_TOKENS: u32 = 8192;
 
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(6);
+const SHELL_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_MAX_STEPS: u32 = 120;
 const ACTION_SETTLE_MS: u64 = 400;
 const MAX_RECORDING_KEYFRAMES: usize = 4;
@@ -236,6 +237,35 @@ where
         for tool_call in tool_uses {
             let tool_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
             let input = tool_call.get("input").cloned().unwrap_or_else(|| json!({}));
+            let tool_name = tool_call.get("name").and_then(Value::as_str).unwrap_or("computer");
+
+            // Shell tool: run a command instead of clicking, when a CLI/script is the better path.
+            // Deterministic, so it captures and replays cleanly.
+            if tool_name == "run_command" {
+                let command = input.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                emit(AgentEvent::Action {
+                    step_number,
+                    tool: "shell".to_string(),
+                    description: format!("$ {command}"),
+                    params: input.clone(),
+                });
+                let (output, ok) = run_shell(&command);
+                emit(AgentEvent::ActionResult {
+                    step_number,
+                    success: ok,
+                    error: if ok { None } else { Some("command failed".to_string()) },
+                });
+                if ok && !command.trim().is_empty() {
+                    captured_steps.push(json!({"kind": "shell", "command": command}));
+                }
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": [{"type": "text", "text": output}],
+                }));
+                continue;
+            }
+
             let action = input.get("action").and_then(Value::as_str).unwrap_or("").to_string();
             let description = describe_action(&action, &input);
 
@@ -416,6 +446,23 @@ where
             params: step.clone(),
         });
 
+        // Shell steps run in-process, not through the runner.
+        if step.get("kind").and_then(Value::as_str) == Some("shell") {
+            let command = step.get("command").and_then(Value::as_str).unwrap_or("");
+            let (_, ok) = run_shell(command);
+            emit(AgentEvent::ActionResult {
+                step_number,
+                success: ok,
+                error: if ok { None } else { Some("command failed".to_string()) },
+            });
+            std::thread::sleep(Duration::from_millis(ACTION_SETTLE_MS));
+            if let Ok(s) = runner.take_screenshot(SCREENSHOT_TIMEOUT) {
+                emit(AgentEvent::Screenshot { step_number, base64: s.base64, width: s.width, height: s.height });
+            }
+            step_number += 1;
+            continue;
+        }
+
         let request = RunnerStepRequest {
             workflow_id: "agent_replay".to_string(),
             outer_run_id: "agent_replay_run".to_string(),
@@ -473,6 +520,7 @@ fn describe_step(step: &Value) -> String {
         "scroll" => format!("scroll {}", step.get("direction").and_then(Value::as_str).unwrap_or("")),
         "drag" => "drag".to_string(),
         "delay" => "wait".to_string(),
+        "shell" => format!("$ {}", step.get("command").and_then(Value::as_str).unwrap_or("")),
         other => other.to_string(),
     }
 }
@@ -919,6 +967,7 @@ RULES:
 - After navigating or opening something, use the `wait` action to let the UI load before acting.
 - Prefer keyboard shortcuts where they are reliable (e.g. cmd+t new tab, cmd+l address bar, cmd+c/cmd+v).
 - To type into a field, click it first, then use the `type` action.
+- You also have a `run_command` tool (shell). When a command line, script, or API can accomplish a step more reliably than clicking — opening a URL or app (`open`), file operations, `git`, an app's CLI, or automating a Mac app via AppleScript (`osascript`) — prefer it. It's faster and more robust than vision, and a few well-chosen commands can replace many clicks. Use it to discover options too (`which`, `--help`).
 - If an action doesn't produce the expected result, try a different approach rather than repeating it.
 - When the task is fully complete, stop and briefly state what you accomplished (do not call the tool again)."#
         .to_string()
@@ -951,16 +1000,72 @@ fn build_first_user_message(
 // ---- Claude API (computer use) ----
 
 fn tool_definitions(display_width: u32, display_height: u32) -> Vec<Value> {
-    vec![json!({
-        "type": COMPUTER_TOOL_TYPE,
-        "name": "computer",
-        "display_width_px": display_width,
-        "display_height_px": display_height,
-        "display_number": 1,
-        // Lets the model inspect a region at full resolution to read small/faded text — important
-        // since the multi-display composite is downscaled.
-        "enable_zoom": true,
-    })]
+    vec![
+        json!({
+            "type": COMPUTER_TOOL_TYPE,
+            "name": "computer",
+            "display_width_px": display_width,
+            "display_height_px": display_height,
+            "display_number": 1,
+            // Lets the model inspect a region at full resolution to read small/faded text —
+            // important since the multi-display composite is downscaled.
+            "enable_zoom": true,
+        }),
+        json!({
+            "name": "run_command",
+            "description": "Run a shell command on the user's Mac (bash, non-interactive). Strongly prefer this over clicking when a command line, script, or API can do the step more reliably and quickly — e.g. opening a URL or app (`open`), file operations, `git`, an app's own CLI, or automating Mac apps via AppleScript (`osascript -e '...'`). You can also use it to discover what's available (`which`, `--help`, `ls`). Returns stdout, stderr, and exit code. Runs with the user's environment and permissions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run."},
+                    "description": {"type": "string", "description": "What this command does."}
+                },
+                "required": ["command"]
+            }
+        }),
+    ]
+}
+
+/// Runs a shell command (bash, no stdin) with a timeout, returning (output_text, success).
+fn run_shell(command: &str) -> (String, bool) {
+    use std::process::{Command, Stdio};
+
+    let cmd = command.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = Command::new("bash")
+            .arg("-lc")
+            .arg(&cmd)
+            .stdin(Stdio::null())
+            .output();
+        let _ = tx.send(out);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(SHELL_TIMEOUT_SECS)) {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let code = out.status.code().unwrap_or(-1);
+            let mut text = format!("exit code {code}");
+            if !stdout.trim().is_empty() {
+                text.push_str("\n[stdout]\n");
+                text.push_str(stdout.trim_end());
+            }
+            if !stderr.trim().is_empty() {
+                text.push_str("\n[stderr]\n");
+                text.push_str(stderr.trim_end());
+            }
+            // Bound the output so a chatty command can't blow up the context window.
+            if text.len() > 4000 {
+                text.truncate(4000);
+                text.push_str("\n…(output truncated)");
+            }
+            (text, out.status.success())
+        }
+        Ok(Err(e)) => (format!("failed to run command: {e}"), false),
+        // The command keeps running in the background after a timeout; we just stop waiting.
+        Err(_) => (format!("command timed out after {SHELL_TIMEOUT_SECS}s"), false),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1074,6 +1179,16 @@ mod tests {
         assert!(summary.contains("Typed \"/remot\""), "summary was: {summary}");
         assert!(summary.contains("Pressed Tab"), "summary was: {summary}");
         assert!(summary.contains("Pressed Return"), "summary was: {summary}");
+    }
+
+    #[test]
+    fn run_shell_captures_output_and_status() {
+        let (out, ok) = run_shell("echo hello-from-shell");
+        assert!(ok, "expected success, got: {out}");
+        assert!(out.contains("hello-from-shell"), "output was: {out}");
+
+        let (_out, ok) = run_shell("exit 3");
+        assert!(!ok, "expected non-zero exit to report failure");
     }
 
     #[test]
