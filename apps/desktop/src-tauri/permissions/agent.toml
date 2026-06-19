@@ -9,6 +9,16 @@ description = "Enables the start_agent_from_task command without any pre-configu
 commands.allow = ["start_agent_from_task"]
 
 [[permission]]
+identifier = "allow-replay-agent-script"
+description = "Enables the replay_agent_script command without any pre-configured scope."
+commands.allow = ["replay_agent_script"]
+
+[[permission]]
+identifier = "allow-agent-script-exists"
+description = "Enables the agent_script_exists command without any pre-configured scope."
+commands.allow = ["agent_script_exists"]
+
+[[permission]]
 identifier = "allow-stop-agent"
 description = "Enables the stop_agent command without any pre-configured scope."
 commands.allow = ["stop_agent"]

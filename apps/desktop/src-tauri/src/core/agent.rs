@@ -135,6 +135,8 @@ where
     let mut step_number: u32 = 0;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    // Concrete runner steps actually executed, in order — saved on success as a replayable script.
+    let mut captured_steps: Vec<Value> = Vec::new();
 
     // Take an initial screenshot. Its (logical-point) dimensions define the computer tool's
     // display size so the model's coordinates land 1:1 on our clicks.
@@ -210,6 +212,9 @@ where
                 .filter_map(|b| b.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // Save the executed steps as a replayable script so this task can be re-run fast
+            // (deterministically, no LLM) next time.
+            save_script(storage, config.session_id, &task, &captured_steps);
             emit(AgentEvent::Completed {
                 step_number,
                 summary: if text.trim().is_empty() { "Task completed.".to_string() } else { text },
@@ -305,7 +310,11 @@ where
             // sighted on failures matters more than the error flag. The failure is conveyed in text.
             let mut content: Vec<Value> = Vec::new();
             match &exec {
-                Ok(_) => {
+                Ok(step) => {
+                    // Record the concrete step for the replayable script.
+                    if let Some(step) = step {
+                        captured_steps.push(step.clone());
+                    }
                     emit(AgentEvent::ActionResult { step_number, success: true, error: None });
                 }
                 Err(err) => {
@@ -336,18 +345,143 @@ where
     }
 }
 
+// ---- Script capture & replay ----
+
+fn script_key(session_id: Option<i64>) -> String {
+    match session_id {
+        Some(id) => format!("agent_script_session_{id}"),
+        None => "agent_script_task_last".to_string(),
+    }
+}
+
+fn save_script(storage: &Storage, session_id: Option<i64>, task: &str, steps: &[Value]) {
+    if steps.is_empty() {
+        return;
+    }
+    let payload = json!({ "task": task, "steps": steps });
+    let _ = storage.upsert_app_setting(&script_key(session_id), &payload.to_string());
+}
+
+/// Loads a previously-captured replay script for a session (or the last no-record task).
+pub fn load_script(storage: &Storage, session_id: Option<i64>) -> Option<(String, Vec<Value>)> {
+    let raw = storage.get_app_setting(&script_key(session_id)).ok().flatten()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let task = value.get("task").and_then(Value::as_str).unwrap_or("").to_string();
+    let steps = value.get("steps").and_then(Value::as_array)?.clone();
+    if steps.is_empty() {
+        return None;
+    }
+    Some((task, steps))
+}
+
+pub fn has_script(storage: &Storage, session_id: Option<i64>) -> bool {
+    load_script(storage, session_id).is_some()
+}
+
+/// Replays a captured script deterministically through the runner — no LLM, no per-step thinking.
+/// Emits the same progress events as a live run. On a step error it stops and reports that the UI
+/// may have changed (the vision fallback is the next phase).
+pub fn run_script<F>(
+    runner_binary: &Path,
+    steps: Vec<Value>,
+    cancel_token: Arc<AtomicBool>,
+    emit: F,
+) -> Result<(), String>
+where
+    F: Fn(AgentEvent) + Send,
+{
+    let mut runner = RunnerBridge::spawn(runner_binary)
+        .map_err(|e| format!("failed to start runner: {e}"))?;
+
+    let mut step_number: u32 = 0;
+    if let Ok(s) = runner.take_screenshot(SCREENSHOT_TIMEOUT) {
+        emit(AgentEvent::Screenshot { step_number, base64: s.base64, width: s.width, height: s.height });
+    }
+
+    for step in &steps {
+        if cancel_token.load(Ordering::Relaxed) {
+            emit(AgentEvent::Cancelled { step_number });
+            return Ok(());
+        }
+
+        let description = describe_step(step);
+        emit(AgentEvent::Action {
+            step_number,
+            tool: "replay".to_string(),
+            description: description.clone(),
+            params: step.clone(),
+        });
+
+        let request = RunnerStepRequest {
+            workflow_id: "agent_replay".to_string(),
+            outer_run_id: "agent_replay_run".to_string(),
+            step_index: step_number as usize,
+            attempt: 1,
+            operation_label: description,
+            step: step.clone(),
+        };
+
+        match runner.execute_step(&request, ACTION_TIMEOUT) {
+            Ok(_) => emit(AgentEvent::ActionResult { step_number, success: true, error: None }),
+            Err(e) => {
+                let err = e.to_string();
+                emit(AgentEvent::ActionResult { step_number, success: false, error: Some(err.clone()) });
+                emit(AgentEvent::Failed {
+                    step_number,
+                    error: format!("Replay step failed ({err}). The UI may have changed — re-run with AI to refresh the script."),
+                });
+                return Ok(());
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(ACTION_SETTLE_MS));
+        if let Ok(s) = runner.take_screenshot(SCREENSHOT_TIMEOUT) {
+            emit(AgentEvent::Screenshot { step_number, base64: s.base64, width: s.width, height: s.height });
+        }
+        step_number += 1;
+    }
+
+    emit(AgentEvent::Completed {
+        step_number,
+        summary: format!("Replayed {} steps deterministically (no AI).", steps.len()),
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+    });
+    Ok(())
+}
+
+/// Human-readable label for a captured runner step (for the replay progress UI).
+fn describe_step(step: &Value) -> String {
+    let kind = step.get("kind").and_then(Value::as_str).unwrap_or("step");
+    let num = |k: &str| step.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    match kind {
+        "clickAt" => format!("click at ({:.0}, {:.0})", num("x"), num("y")),
+        "moveMouse" => format!("move to ({:.0}, {:.0})", num("x"), num("y")),
+        "typeText" => format!("type \"{}\"", step.get("text").and_then(Value::as_str).unwrap_or("")),
+        "keyPress" => format!("press {}", step.get("key").and_then(Value::as_str).unwrap_or("")),
+        "holdKey" => format!("hold {}", step.get("key").and_then(Value::as_str).unwrap_or("")),
+        "scroll" => format!("scroll {}", step.get("direction").and_then(Value::as_str).unwrap_or("")),
+        "drag" => "drag".to_string(),
+        "delay" => "wait".to_string(),
+        other => other.to_string(),
+    }
+}
+
 // ---- Tool execution ----
 
+/// Executes one computer-use action. Returns the concrete runner step that was run (with global
+/// coordinates already resolved), so the caller can record it into a replayable script. `None`
+/// means the action needed no runner step (a screenshot/cursor query).
 fn execute_computer_action(
     runner: &mut RunnerBridge,
     action: &str,
     input: &Value,
     view: &View,
-) -> Result<(), String> {
+) -> Result<Option<Value>, String> {
     // `screenshot` and `cursor_position` need no runner step — the screenshot we take after every
     // action is the feedback the model is asking for.
     if action == "screenshot" || action == "cursor_position" {
-        return Ok(());
+        return Ok(None);
     }
 
     // Map a coordinate from the screenshot the model saw into the global click space, accounting
@@ -430,11 +564,11 @@ fn execute_computer_action(
         step_index: 0,
         attempt: 1,
         operation_label: action.to_string(),
-        step: step_json,
+        step: step_json.clone(),
     };
 
     runner.execute_step(&request, ACTION_TIMEOUT)
-        .map(|_: crate::core::runner::RunnerStepResult| ())
+        .map(|_: crate::core::runner::RunnerStepResult| Some(step_json))
         .map_err(|e: crate::core::runner::RunnerError| e.to_string())
 }
 

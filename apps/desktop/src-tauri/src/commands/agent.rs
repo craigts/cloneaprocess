@@ -117,6 +117,51 @@ pub fn stop_agent(agent_state: State<'_, AgentState>) -> Result<(), String> {
     }
 }
 
+/// Whether a captured replay script exists for this session (or the last no-record task).
+#[tauri::command]
+pub fn agent_script_exists(state: State<'_, AppState>, session_id: Option<i64>) -> Result<bool, String> {
+    Ok(agent::has_script(state.storage(), session_id))
+}
+
+/// Replays a previously-captured run deterministically through the runner — fast, no LLM.
+#[tauri::command]
+pub fn replay_agent_script(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_state: State<'_, AgentState>,
+    session_id: Option<i64>,
+) -> Result<(), String> {
+    {
+        let guard = agent_state.cancel_token.lock().map_err(|_| "lock poisoned")?;
+        if let Some(token) = &*guard {
+            if !token.load(Ordering::Relaxed) {
+                return Err("An agent is already running. Stop it first.".to_string());
+            }
+        }
+    }
+
+    let (_task, steps) = agent::load_script(state.storage(), session_id)
+        .ok_or_else(|| "No saved script yet — run this with AI once, then you can replay it.".to_string())?;
+
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = agent_state.cancel_token.lock().map_err(|_| "lock poisoned")?;
+        *guard = Some(Arc::clone(&cancel_token));
+    }
+
+    let runner_binary = state.runner_binary().to_path_buf();
+    std::thread::spawn(move || {
+        let result = agent::run_script(&runner_binary, steps, cancel_token, |event: AgentEvent| {
+            let _ = app.emit("agent:progress", &event);
+        });
+        if let Err(err) = result {
+            let _ = app.emit("agent:progress", &AgentEvent::Failed { step_number: 0, error: err });
+        }
+    });
+
+    Ok(())
+}
+
 fn resolve_api_key(state: &State<'_, AppState>) -> Result<String, String> {
     if let Ok(Some(key)) = state.storage().get_app_setting("anthropic_api_key") {
         if !key.trim().is_empty() {

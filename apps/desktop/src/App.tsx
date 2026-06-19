@@ -128,6 +128,7 @@ export function App() {
   const [agentResult, setAgentResult] = useState<string | null>(null)
   const [agentError, setAgentError] = useState<string | null>(null)
   const [taskDraft, setTaskDraft] = useState('')
+  const [scriptAvailable, setScriptAvailable] = useState(false)
   const agentListenerRef = useRef<UnlistenFn | null>(null)
 
   // --- data loading ---
@@ -423,6 +424,7 @@ export function App() {
           setAgentRunning(false)
           setAgentStatus('Done')
           setAgentResult(e.summary)
+          setScriptAvailable(true) // a replayable script was just captured
           break
         case 'failed':
           setAgentRunning(false)
@@ -470,9 +472,28 @@ export function App() {
     }
   }
 
+  // Replay a previously-captured run deterministically (no AI, seconds not minutes).
+  async function handleReplayScript() {
+    await beginAgentRun()
+    try {
+      await invoke('replay_agent_script', { sessionId: selectedSessionId ?? null })
+    } catch (err) {
+      handleAgentStartError(err)
+    }
+  }
+
   async function handleStopAgent() {
     try { await invoke('stop_agent') } catch {}
   }
+
+  // Whether a replay script exists for the current selection (refreshed on session change).
+  useEffect(() => {
+    let cancelled = false
+    invoke<boolean>('agent_script_exists', { sessionId: selectedSessionId ?? null })
+      .then((exists) => { if (!cancelled) setScriptAvailable(!!exists) })
+      .catch(() => { if (!cancelled) setScriptAvailable(false) })
+    return () => { cancelled = true }
+  }, [selectedSessionId])
 
   // Cleanup listener on unmount
   useEffect(() => {
@@ -605,9 +626,16 @@ export function App() {
           <>
             <div className="automate-actions">
               {!agentRunning ? (
-                <button type="button" className="primary-btn" disabled={selectedSessionId == null} onClick={() => void handleStartAgent()}>
-                  Run agent
-                </button>
+                <>
+                  <button type="button" className="primary-btn" disabled={selectedSessionId == null} onClick={() => void handleStartAgent()}>
+                    Run agent
+                  </button>
+                  {scriptAvailable ? (
+                    <button type="button" className="secondary-btn" title="Replay the saved run deterministically — no AI, much faster" onClick={() => void handleReplayScript()}>
+                      Replay (fast, no AI)
+                    </button>
+                  ) : null}
+                </>
               ) : (
                 <button type="button" className="stop-btn" onClick={() => void handleStopAgent()}>
                   Stop agent
