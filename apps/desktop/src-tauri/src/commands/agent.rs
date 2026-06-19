@@ -7,12 +7,16 @@ use crate::core::agent::{self, AgentConfig, AgentEvent};
 use crate::core::app_state::AppState;
 
 pub struct AgentState {
+    /// True while a run/replay thread is active. Reset by the worker thread when it exits, so the
+    /// next run can start without needing the user to press Stop.
+    running: Arc<AtomicBool>,
     cancel_token: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl AgentState {
     pub fn new() -> Self {
         Self {
+            running: Arc::new(AtomicBool::new(false)),
             cancel_token: Mutex::new(None),
         }
     }
@@ -54,14 +58,8 @@ fn spawn_agent(
     task: Option<String>,
     max_steps: Option<u32>,
 ) -> Result<(), String> {
-    // Check if agent is already running
-    {
-        let guard = agent_state.cancel_token.lock().map_err(|_| "lock poisoned")?;
-        if let Some(token) = &*guard {
-            if !token.load(Ordering::Relaxed) {
-                return Err("An agent is already running. Stop it first.".to_string());
-            }
-        }
+    if agent_state.running.load(Ordering::Relaxed) {
+        return Err("An agent is already running. Stop it first.".to_string());
     }
 
     let api_key = resolve_api_key(&state)?;
@@ -84,6 +82,9 @@ fn spawn_agent(
         cancel_token,
     };
 
+    agent_state.running.store(true, Ordering::Relaxed);
+    let running = Arc::clone(&agent_state.running);
+
     // Spawn the agent on a background thread
     std::thread::spawn(move || {
         let result = agent::run_agent(
@@ -101,6 +102,7 @@ fn spawn_agent(
                 error: err,
             });
         }
+        running.store(false, Ordering::Relaxed);
     });
 
     Ok(())
@@ -131,13 +133,8 @@ pub fn replay_agent_script(
     agent_state: State<'_, AgentState>,
     session_id: Option<i64>,
 ) -> Result<(), String> {
-    {
-        let guard = agent_state.cancel_token.lock().map_err(|_| "lock poisoned")?;
-        if let Some(token) = &*guard {
-            if !token.load(Ordering::Relaxed) {
-                return Err("An agent is already running. Stop it first.".to_string());
-            }
-        }
+    if agent_state.running.load(Ordering::Relaxed) {
+        return Err("An agent is already running. Stop it first.".to_string());
     }
 
     let (_task, steps) = agent::load_script(state.storage(), session_id)
@@ -149,6 +146,9 @@ pub fn replay_agent_script(
         *guard = Some(Arc::clone(&cancel_token));
     }
 
+    agent_state.running.store(true, Ordering::Relaxed);
+    let running = Arc::clone(&agent_state.running);
+
     let runner_binary = state.runner_binary().to_path_buf();
     std::thread::spawn(move || {
         let result = agent::run_script(&runner_binary, steps, cancel_token, |event: AgentEvent| {
@@ -157,6 +157,7 @@ pub fn replay_agent_script(
         if let Err(err) = result {
             let _ = app.emit("agent:progress", &AgentEvent::Failed { step_number: 0, error: err });
         }
+        running.store(false, Ordering::Relaxed);
     });
 
     Ok(())
