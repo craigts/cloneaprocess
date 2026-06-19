@@ -46,6 +46,7 @@ protocol RunnerActionPerforming {
     func moveMouse(x: Double, y: Double) throws -> [String: Any]
     func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any]
     func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any]
+    func zoomCapture(x: Double, y: Double, width: Double, height: Double, quality: Double) throws -> [String: Any]
     func selectMenu(path: [String]) throws -> [String: Any]
     func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any]
     func assertCondition(condition: [String: Any]) throws -> [String: Any]
@@ -73,6 +74,9 @@ extension RunnerActionPerforming {
     }
     func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any] {
         throw RunnerServiceError.unsupportedStep("dragTo is not supported by this performer")
+    }
+    func zoomCapture(x: Double, y: Double, width: Double, height: Double, quality: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("zoomCapture is not supported by this performer")
     }
 }
 
@@ -133,6 +137,14 @@ final class RunnerBridgeSession {
             case "take_screenshot":
                 let quality = (payload["quality"] as? NSNumber)?.doubleValue ?? 0.6
                 let result = try performer.takeScreenshot(quality: quality)
+                return [serializeReply(id: requestId, ok: true, payload: result)]
+            case "zoom":
+                let x = (payload["x"] as? NSNumber)?.doubleValue ?? 0
+                let y = (payload["y"] as? NSNumber)?.doubleValue ?? 0
+                let width = (payload["width"] as? NSNumber)?.doubleValue ?? 0
+                let height = (payload["height"] as? NSNumber)?.doubleValue ?? 0
+                let quality = (payload["quality"] as? NSNumber)?.doubleValue ?? 0.7
+                let result = try performer.zoomCapture(x: x, y: y, width: width, height: height, quality: quality)
                 return [serializeReply(id: requestId, ok: true, payload: result)]
             case "abort_run":
                 return [
@@ -1112,6 +1124,85 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         ]
         #else
         throw RunnerServiceError.executionFailed("screenshot is only available on macOS")
+        #endif
+    }
+
+    func zoomCapture(x: Double, y: Double, width: Double, height: Double, quality: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices) && canImport(ImageIO) && canImport(UniformTypeIdentifiers)
+        // x/y/width/height are in global points. Capture the display containing the region center
+        // at full physical resolution and crop to the requested rect, so the model can read fine
+        // detail (e.g. faded vs. regular text) that is lost in the downscaled full-desktop image.
+        let center = CGPoint(x: x + width / 2, y: y + height / 2)
+        var ids = [CGDirectDisplayID](repeating: 0, count: 1)
+        var matching: UInt32 = 0
+        let displayID: CGDirectDisplayID
+        if CGGetDisplaysWithPoint(center, 1, &ids, &matching) == .success, matching > 0, ids[0] != 0 {
+            displayID = ids[0]
+        } else {
+            displayID = CGMainDisplayID()
+        }
+        guard let full = CGDisplayCreateImage(displayID) else {
+            throw RunnerServiceError.executionFailed("failed to capture display for zoom")
+        }
+        let bounds = CGDisplayBounds(displayID)
+        let backing = bounds.width > 0 ? Double(full.width) / Double(bounds.width) : 1.0
+
+        // Convert the global-point rect into the capture's physical pixels (top-left origin),
+        // clamped to the image bounds.
+        let px = max(0.0, (x - Double(bounds.minX)) * backing)
+        let py = max(0.0, (y - Double(bounds.minY)) * backing)
+        let pw = min(width * backing, Double(full.width) - px)
+        let ph = min(height * backing, Double(full.height) - py)
+        guard pw >= 1, ph >= 1,
+              let cropped = full.cropping(to: CGRect(x: px, y: py, width: pw, height: ph)) else {
+            throw RunnerServiceError.executionFailed("zoom region is outside the display")
+        }
+
+        // Cap the long edge so the zoomed image stays a reasonable size.
+        let maxEdge = 1536
+        let longEdge = max(cropped.width, cropped.height)
+        let outImage: CGImage
+        if longEdge > maxEdge {
+            let factor = Double(maxEdge) / Double(longEdge)
+            let w = max(1, Int((Double(cropped.width) * factor).rounded()))
+            let h = max(1, Int((Double(cropped.height) * factor).rounded()))
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            guard let ctx = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                throw RunnerServiceError.executionFailed("failed to create zoom context")
+            }
+            ctx.interpolationQuality = .high
+            ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: w, height: h))
+            guard let scaled = ctx.makeImage() else {
+                throw RunnerServiceError.executionFailed("failed to scale zoom image")
+            }
+            outImage = scaled
+        } else {
+            outImage = cropped
+        }
+
+        let data = NSMutableData()
+        let jpegType = UTType.jpeg.identifier as CFString
+        guard let destination = CGImageDestinationCreateWithData(data, jpegType, 1, nil) else {
+            throw RunnerServiceError.executionFailed("failed to create JPEG destination")
+        }
+        CGImageDestinationAddImage(destination, outImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw RunnerServiceError.executionFailed("failed to finalize zoom JPEG")
+        }
+        let base64 = (data as Data).base64EncodedString()
+
+        return [
+            "action": "zoom",
+            "base64": base64,
+            "width": outImage.width,
+            "height": outImage.height,
+            "format": "jpeg",
+        ]
+        #else
+        throw RunnerServiceError.executionFailed("zoom is only available on macOS")
         #endif
     }
 }

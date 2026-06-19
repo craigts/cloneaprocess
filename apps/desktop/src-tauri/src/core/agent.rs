@@ -217,6 +217,53 @@ where
                 params: input.clone(),
             });
 
+            // `zoom` is a read-only detail view: capture the requested region at full resolution
+            // and return it, without taking a fresh full-desktop screenshot or advancing `view`
+            // (the model still clicks against the composite it already has).
+            if action == "zoom" {
+                let region = input.get("region").and_then(Value::as_array).and_then(|r| {
+                    Some((r.first()?.as_f64()?, r.get(1)?.as_f64()?, r.get(2)?.as_f64()?, r.get(3)?.as_f64()?))
+                });
+                let content = match region {
+                    Some((x1, y1, x2, y2)) => {
+                        let gx = turn_view.origin_x + x1.min(x2) * turn_view.point_scale;
+                        let gy = turn_view.origin_y + y1.min(y2) * turn_view.point_scale;
+                        let gw = (x2 - x1).abs() * turn_view.point_scale;
+                        let gh = (y2 - y1).abs() * turn_view.point_scale;
+                        match runner.zoom_capture(gx, gy, gw, gh, SCREENSHOT_TIMEOUT) {
+                            Ok(z) => {
+                                emit(AgentEvent::Screenshot {
+                                    step_number, base64: z.base64.clone(), width: z.width, height: z.height,
+                                });
+                                emit(AgentEvent::ActionResult { step_number, success: true, error: None });
+                                vec![
+                                    json!({"type": "text", "text": "Zoomed view of the requested region:"}),
+                                    image_block(&z.base64),
+                                ]
+                            }
+                            Err(e) => {
+                                let err = e.to_string();
+                                emit(AgentEvent::ActionResult { step_number, success: false, error: Some(err.clone()) });
+                                vec![json!({"type": "text", "text": format!("Zoom failed: {err}")})]
+                            }
+                        }
+                    }
+                    None => {
+                        emit(AgentEvent::ActionResult {
+                            step_number, success: false,
+                            error: Some("zoom requires region [x1, y1, x2, y2]".to_string()),
+                        });
+                        vec![json!({"type": "text", "text": "zoom requires a region [x1, y1, x2, y2]"})]
+                    }
+                };
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": content,
+                }));
+                continue;
+            }
+
             let exec = execute_computer_action(&mut runner, &action, &input, &turn_view);
 
             // Let the UI settle, then capture the result so the model sees the consequence. The
@@ -665,6 +712,7 @@ RULES:
 - Take ONE action at a time, then look at the resulting screenshot before deciding the next action.
 - Coordinates are in the screenshot's pixel space; click precisely on the element you can see.
 - The screenshot shows ALL of the user's displays composited side by side, so it may be a wide image spanning multiple monitors (black regions are gaps between displays). Scan the whole image — the window you need may be on a different monitor than you expect, not just the left portion.
+- Because the image spans all monitors it is downscaled, so small text can be hard to read. When you need to read fine detail to make a decision (e.g. distinguishing enabled vs. disabled or active vs. faded/archived items, small labels), use the `zoom` action on that region first to see it at full resolution, then act.
 - After navigating or opening something, use the `wait` action to let the UI load before acting.
 - Prefer keyboard shortcuts where they are reliable (e.g. cmd+t new tab, cmd+l address bar, cmd+c/cmd+v).
 - To type into a field, click it first, then use the `type` action.
@@ -705,6 +753,9 @@ fn tool_definitions(display_width: u32, display_height: u32) -> Vec<Value> {
         "display_width_px": display_width,
         "display_height_px": display_height,
         "display_number": 1,
+        // Lets the model inspect a region at full resolution to read small/faded text — important
+        // since the multi-display composite is downscaled.
+        "enable_zoom": true,
     })]
 }
 

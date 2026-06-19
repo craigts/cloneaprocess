@@ -190,7 +190,35 @@ impl RunnerBridge {
             "type": "take_screenshot",
             "payload": { "quality": 0.5 }
         });
+        self.request_image(&request_id, &request_json, timeout, "screenshot")
+    }
 
+    /// Captures a region of the global display space (in points) at full resolution — backs the
+    /// computer-use `zoom` action so the model can read small/faded UI text.
+    pub fn zoom_capture(
+        &mut self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        timeout: Duration,
+    ) -> Result<ScreenshotResult, RunnerError> {
+        let request_id = format!("req_zoom_{}", uuid_short());
+        let request_json = json!({
+            "id": request_id,
+            "type": "zoom",
+            "payload": { "x": x, "y": y, "width": width, "height": height, "quality": 0.7 }
+        });
+        self.request_image(&request_id, &request_json, timeout, "zoom")
+    }
+
+    fn request_image(
+        &mut self,
+        request_id: &str,
+        request_json: &Value,
+        timeout: Duration,
+        operation: &'static str,
+    ) -> Result<ScreenshotResult, RunnerError> {
         writeln!(self.stdin, "{}", request_json)?;
         self.stdin.flush()?;
 
@@ -199,7 +227,7 @@ impl RunnerBridge {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(RunnerError::Timeout {
-                    operation: "screenshot",
+                    operation,
                     stderr_tail: self.stderr_summary(),
                 });
             }
@@ -210,13 +238,13 @@ impl RunnerBridge {
                         RunnerError::InvalidProtocol(format!("invalid json from runner: {e}"))
                     })?;
 
-                    if message.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                    if message.get("id").and_then(Value::as_str) != Some(request_id) {
                         continue;
                     }
 
                     if !message.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                         return Err(parse_reply_error(&message).unwrap_or_else(|| {
-                            RunnerError::InvalidProtocol("screenshot failed".to_string())
+                            RunnerError::InvalidProtocol(format!("{operation} failed"))
                         }));
                     }
 
