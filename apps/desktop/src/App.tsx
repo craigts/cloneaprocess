@@ -127,6 +127,8 @@ export function App() {
   const [agentStep, setAgentStep] = useState(0)
   const [agentResult, setAgentResult] = useState<string | null>(null)
   const [agentError, setAgentError] = useState<string | null>(null)
+  const [taskDraft, setTaskDraft] = useState('')
+  const [scriptAvailable, setScriptAvailable] = useState(false)
   const agentListenerRef = useRef<UnlistenFn | null>(null)
 
   // --- data loading ---
@@ -384,15 +386,8 @@ export function App() {
 
   // --- agent ---
 
-  async function handleStartAgent() {
-    if (selectedSessionId == null) return
-    // Auto-save description
-    const trimmed = descriptionDraft.trim()
-    if (trimmed !== (selectedSession?.description ?? '')) {
-      await invoke('update_session_description', { sessionId: selectedSessionId, description: trimmed || null }).catch(() => {})
-    }
-
-    // Reset agent state
+  // Resets agent UI state and attaches the progress listener — shared by both run paths.
+  async function beginAgentRun() {
     setAgentRunning(true)
     setAgentScreenshot(null)
     setAgentStatus('Starting agent...')
@@ -401,7 +396,6 @@ export function App() {
     setAgentResult(null)
     setAgentError(null)
 
-    // Listen for events
     if (agentListenerRef.current) { agentListenerRef.current(); agentListenerRef.current = null }
     agentListenerRef.current = await listen<AgentProgressEvent>('agent:progress', (event) => {
       const e = event.payload
@@ -430,32 +424,87 @@ export function App() {
           setAgentRunning(false)
           setAgentStatus('Done')
           setAgentResult(e.summary)
+          void refreshScriptAvailability() // a run that did work captures a replayable script
           break
         case 'failed':
           setAgentRunning(false)
           setAgentStatus('Failed')
           setAgentError(e.error)
+          void refreshScriptAvailability() // partial runs (cap/cancel) still save what they did
           break
         case 'cancelled':
           setAgentRunning(false)
           setAgentStatus('Cancelled')
+          void refreshScriptAvailability()
           break
       }
     })
+  }
 
-    // Start the agent
+  function handleAgentStartError(err: unknown) {
+    setAgentRunning(false)
+    setAgentError(String(err))
+    if (agentListenerRef.current) { agentListenerRef.current(); agentListenerRef.current = null }
+  }
+
+  // Run against a recorded session (demonstration).
+  async function handleStartAgent() {
+    if (selectedSessionId == null) return
+    const trimmed = descriptionDraft.trim()
+    if (trimmed !== (selectedSession?.description ?? '')) {
+      await invoke('update_session_description', { sessionId: selectedSessionId, description: trimmed || null }).catch(() => {})
+    }
+    await beginAgentRun()
     try {
-      await invoke('start_agent', { sessionId: selectedSessionId, maxSteps: 50 })
+      await invoke('start_agent', { sessionId: selectedSessionId })
     } catch (err) {
-      setAgentRunning(false)
-      setAgentError(String(err))
-      if (agentListenerRef.current) { agentListenerRef.current(); agentListenerRef.current = null }
+      handleAgentStartError(err)
+    }
+  }
+
+  // Run from a description alone, no recording — the agent explores the live screen.
+  async function handleStartAgentFromTask() {
+    const task = taskDraft.trim()
+    if (!task) return
+    await beginAgentRun()
+    try {
+      await invoke('start_agent_from_task', { task })
+    } catch (err) {
+      handleAgentStartError(err)
+    }
+  }
+
+  // Replay a previously-captured run deterministically (no AI, seconds not minutes).
+  async function handleReplayScript() {
+    await beginAgentRun()
+    try {
+      await invoke('replay_agent_script', { sessionId: selectedSessionId ?? null })
+    } catch (err) {
+      handleAgentStartError(err)
     }
   }
 
   async function handleStopAgent() {
     try { await invoke('stop_agent') } catch {}
   }
+
+  async function refreshScriptAvailability() {
+    try {
+      const exists = await invoke<boolean>('agent_script_exists', { sessionId: selectedSessionId ?? null })
+      setScriptAvailable(!!exists)
+    } catch {
+      setScriptAvailable(false)
+    }
+  }
+
+  // Whether a replay script exists for the current selection (refreshed on session change).
+  useEffect(() => {
+    let cancelled = false
+    invoke<boolean>('agent_script_exists', { sessionId: selectedSessionId ?? null })
+      .then((exists) => { if (!cancelled) setScriptAvailable(!!exists) })
+      .catch(() => { if (!cancelled) setScriptAvailable(false) })
+    return () => { cancelled = true }
+  }, [selectedSessionId])
 
   // Cleanup listener on unmount
   useEffect(() => {
@@ -585,17 +634,40 @@ export function App() {
             </div>
           </div>
         ) : (
-          <div className="automate-actions">
-            {!agentRunning ? (
-              <button type="button" className="primary-btn" disabled={selectedSessionId == null} onClick={() => void handleStartAgent()}>
-                Run agent
+          <>
+            <div className="automate-actions">
+              {!agentRunning ? (
+                <>
+                  <button type="button" className="primary-btn" disabled={selectedSessionId == null} onClick={() => void handleStartAgent()}>
+                    Run agent
+                  </button>
+                  {scriptAvailable ? (
+                    <button type="button" className="secondary-btn" title="Replay the saved run deterministically — no AI, much faster" onClick={() => void handleReplayScript()}>
+                      Replay (fast, no AI)
+                    </button>
+                  ) : null}
+                </>
+              ) : (
+                <button type="button" className="stop-btn" onClick={() => void handleStopAgent()}>
+                  Stop agent
+                </button>
+              )}
+            </div>
+
+            <div className="no-record-run">
+              <p className="step-subtitle">Or skip recording — just describe the task and let the AI figure it out:</p>
+              <textarea
+                placeholder="e.g. In Claude, turn on remote control for each active session (skip the archived/faded ones)"
+                value={taskDraft}
+                onChange={(e) => setTaskDraft(e.target.value)}
+                rows={2}
+                disabled={agentRunning}
+              />
+              <button type="button" disabled={agentRunning || !taskDraft.trim()} onClick={() => void handleStartAgentFromTask()}>
+                Run from description
               </button>
-            ) : (
-              <button type="button" className="stop-btn" onClick={() => void handleStopAgent()}>
-                Stop agent
-              </button>
-            )}
-          </div>
+            </div>
+          </>
         )}
 
         {agentStatus ? <p className="agent-status">{agentStatus}</p> : null}

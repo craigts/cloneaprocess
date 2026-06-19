@@ -190,7 +190,67 @@ impl RunnerBridge {
             "type": "take_screenshot",
             "payload": { "quality": 0.5 }
         });
+        self.request_image(&request_id, &request_json, timeout, "screenshot")
+    }
 
+    /// Captures a region of the global display space (in points) at full resolution — backs the
+    /// computer-use `zoom` action so the model can read small/faded UI text.
+    pub fn zoom_capture(
+        &mut self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        timeout: Duration,
+    ) -> Result<ScreenshotResult, RunnerError> {
+        let request_id = format!("req_zoom_{}", uuid_short());
+        let request_json = json!({
+            "id": request_id,
+            "type": "zoom",
+            "payload": { "x": x, "y": y, "width": width, "height": height, "quality": 0.7 }
+        });
+        self.request_image(&request_id, &request_json, timeout, "zoom")
+    }
+
+    fn request_image(
+        &mut self,
+        request_id: &str,
+        request_json: &Value,
+        timeout: Duration,
+        operation: &'static str,
+    ) -> Result<ScreenshotResult, RunnerError> {
+        let payload = self.request_payload(request_id, request_json, timeout, operation)?;
+        Ok(ScreenshotResult {
+            base64: payload.get("base64").and_then(Value::as_str).unwrap_or("").to_string(),
+            width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
+            height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
+            scale: payload.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
+            origin_x: payload.get("originX").and_then(Value::as_f64).unwrap_or(0.0),
+            origin_y: payload.get("originY").and_then(Value::as_f64).unwrap_or(0.0),
+            point_scale: payload.get("pointScale").and_then(Value::as_f64).unwrap_or(1.0),
+        })
+    }
+
+    /// Describes the accessibility element at a global point — used to capture a replayable
+    /// selector for a click. Returns the runner's payload (e.g. `{found, role, title, ...}`).
+    pub fn describe_element_at(&mut self, x: f64, y: f64, timeout: Duration) -> Result<Value, RunnerError> {
+        let request_id = format!("req_describe_{}", uuid_short());
+        let request_json = json!({
+            "id": request_id,
+            "type": "describe_element_at",
+            "payload": { "x": x, "y": y }
+        });
+        self.request_payload(&request_id, &request_json, timeout, "describe_element")
+    }
+
+    /// Sends a request and returns the reply's `payload` object.
+    fn request_payload(
+        &mut self,
+        request_id: &str,
+        request_json: &Value,
+        timeout: Duration,
+        operation: &'static str,
+    ) -> Result<Value, RunnerError> {
         writeln!(self.stdin, "{}", request_json)?;
         self.stdin.flush()?;
 
@@ -199,7 +259,7 @@ impl RunnerBridge {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(RunnerError::Timeout {
-                    operation: "screenshot",
+                    operation,
                     stderr_tail: self.stderr_summary(),
                 });
             }
@@ -210,22 +270,17 @@ impl RunnerBridge {
                         RunnerError::InvalidProtocol(format!("invalid json from runner: {e}"))
                     })?;
 
-                    if message.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                    if message.get("id").and_then(Value::as_str) != Some(request_id) {
                         continue;
                     }
 
                     if !message.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                         return Err(parse_reply_error(&message).unwrap_or_else(|| {
-                            RunnerError::InvalidProtocol("screenshot failed".to_string())
+                            RunnerError::InvalidProtocol(format!("{operation} failed"))
                         }));
                     }
 
-                    let payload = message.get("payload").cloned().unwrap_or_else(|| json!({}));
-                    return Ok(ScreenshotResult {
-                        base64: payload.get("base64").and_then(Value::as_str).unwrap_or("").to_string(),
-                        width: payload.get("width").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        height: payload.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    });
+                    return Ok(message.get("payload").cloned().unwrap_or_else(|| json!({})));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(status) = self.child.try_wait()? {
@@ -247,8 +302,19 @@ impl RunnerBridge {
 #[derive(Clone, Debug)]
 pub struct ScreenshotResult {
     pub base64: String,
+    /// Image dimensions in logical points (the runner downscales Retina captures so these
+    /// match the coordinate space `clickAt` posts mouse events in).
     pub width: u32,
     pub height: u32,
+    /// Backing scale factor of the captured display (physical pixels / logical points).
+    pub scale: f64,
+    /// Global top-left of the captured display, in points. Added to image coordinates (after
+    /// `point_scale`) to get global click coordinates — lets capture follow a secondary display.
+    pub origin_x: f64,
+    pub origin_y: f64,
+    /// Logical points per image pixel (1.0 unless the image was capped below the display's
+    /// logical size). `global = origin + image_coord * point_scale`.
+    pub point_scale: f64,
 }
 
 impl RunnerStepExecutor for RunnerBridge {

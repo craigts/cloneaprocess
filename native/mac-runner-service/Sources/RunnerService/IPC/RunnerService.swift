@@ -26,6 +26,7 @@ private let runnerProtocolCapabilities = [
     "key_press",
     "screenshot",
     "subprocess_bridge",
+    "computer_use",
 ]
 
 protocol RunnerActionPerforming {
@@ -33,13 +34,61 @@ protocol RunnerActionPerforming {
     func click(selector: [String: Any]) throws -> [String: Any]
     func rightClick(selector: [String: Any]) throws -> [String: Any]
     func clickAt(x: Double, y: Double, button: String) throws -> [String: Any]
+    // Computer-use clicking: multi-click (double/triple) and held modifiers (shift/cmd-click).
+    func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any]
+    // Describes the accessibility element at a global point (for capturing replayable selectors).
+    func describeElementAt(x: Double, y: Double) throws -> [String: Any]
+    // Clicks an element resolved by selector (drift-resistant), falling back to (x, y) if it no
+    // longer matches. Backs replay of captured click steps.
+    func clickElement(selector: [String: Any], x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any]
     func setText(selector: [String: Any], value: String) throws -> [String: Any]
     func setTextFocused(value: String) throws -> [String: Any]
+    // Types a literal string as real keystrokes into the focused element (reliable in browsers,
+    // unlike AX value-set). Backs the computer-use `type` action.
+    func typeText(text: String) throws -> [String: Any]
     func keyPress(key: String, modifiers: [String]) throws -> [String: Any]
+    func holdKey(key: String, modifiers: [String], durationMs: Int) throws -> [String: Any]
+    func moveMouse(x: Double, y: Double) throws -> [String: Any]
+    func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any]
+    func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any]
+    func zoomCapture(x: Double, y: Double, width: Double, height: Double, quality: Double) throws -> [String: Any]
     func selectMenu(path: [String]) throws -> [String: Any]
     func waitForCondition(condition: [String: Any], timeoutMs: UInt64) throws -> [String: Any]
     func assertCondition(condition: [String: Any]) throws -> [String: Any]
     func takeScreenshot(quality: Double) throws -> [String: Any]
+}
+
+// Default implementations so conformers (e.g. test mocks) needn't implement every computer-use
+// primitive. Declaring them in the protocol body keeps dispatch dynamic — `LiveRunnerActionPerformer`
+// overrides take effect when called through the protocol.
+extension RunnerActionPerforming {
+    func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
+        try clickAt(x: x, y: y, button: button)
+    }
+    func describeElementAt(x: Double, y: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("describeElementAt is not supported by this performer")
+    }
+    func clickElement(selector: [String: Any], x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
+        try clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
+    }
+    func typeText(text: String) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("typeText is not supported by this performer")
+    }
+    func holdKey(key: String, modifiers: [String], durationMs: Int) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("holdKey is not supported by this performer")
+    }
+    func moveMouse(x: Double, y: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("moveMouse is not supported by this performer")
+    }
+    func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("scroll is not supported by this performer")
+    }
+    func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("dragTo is not supported by this performer")
+    }
+    func zoomCapture(x: Double, y: Double, width: Double, height: Double, quality: Double) throws -> [String: Any] {
+        throw RunnerServiceError.unsupportedStep("zoomCapture is not supported by this performer")
+    }
 }
 
 enum RunnerServiceError: Error {
@@ -99,6 +148,19 @@ final class RunnerBridgeSession {
             case "take_screenshot":
                 let quality = (payload["quality"] as? NSNumber)?.doubleValue ?? 0.6
                 let result = try performer.takeScreenshot(quality: quality)
+                return [serializeReply(id: requestId, ok: true, payload: result)]
+            case "zoom":
+                let x = (payload["x"] as? NSNumber)?.doubleValue ?? 0
+                let y = (payload["y"] as? NSNumber)?.doubleValue ?? 0
+                let width = (payload["width"] as? NSNumber)?.doubleValue ?? 0
+                let height = (payload["height"] as? NSNumber)?.doubleValue ?? 0
+                let quality = (payload["quality"] as? NSNumber)?.doubleValue ?? 0.7
+                let result = try performer.zoomCapture(x: x, y: y, width: width, height: height, quality: quality)
+                return [serializeReply(id: requestId, ok: true, payload: result)]
+            case "describe_element_at":
+                let x = (payload["x"] as? NSNumber)?.doubleValue ?? 0
+                let y = (payload["y"] as? NSNumber)?.doubleValue ?? 0
+                let result = try performer.describeElementAt(x: x, y: y)
                 return [serializeReply(id: requestId, ok: true, payload: result)]
             case "abort_run":
                 return [
@@ -231,19 +293,67 @@ final class RunnerBridgeSession {
                   let y = (step["y"] as? NSNumber)?.doubleValue else {
                 throw RunnerServiceError.invalidRequest("clickAt step requires x and y coordinates")
             }
-            return try performer.clickAt(x: x, y: y, button: "left")
+            let button = step["button"] as? String ?? "left"
+            let clickCount = (step["clickCount"] as? NSNumber)?.intValue ?? 1
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
+        case "clickElement":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("clickElement step requires x and y fallback coordinates")
+            }
+            let selector = step["selector"] as? [String: Any] ?? [:]
+            let button = step["button"] as? String ?? "left"
+            let clickCount = (step["clickCount"] as? NSNumber)?.intValue ?? 1
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.clickElement(selector: selector, x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
         case "rightClickAt":
             guard let x = (step["x"] as? NSNumber)?.doubleValue,
                   let y = (step["y"] as? NSNumber)?.doubleValue else {
                 throw RunnerServiceError.invalidRequest("rightClickAt step requires x and y coordinates")
             }
-            return try performer.clickAt(x: x, y: y, button: "right")
+            return try performer.clickAt(x: x, y: y, button: "right", clickCount: 1, modifiers: [])
+        case "moveMouse":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("moveMouse step requires x and y coordinates")
+            }
+            return try performer.moveMouse(x: x, y: y)
+        case "typeText":
+            guard let text = step["text"] as? String else {
+                throw RunnerServiceError.invalidRequest("typeText step requires text")
+            }
+            return try performer.typeText(text: text)
+        case "scroll":
+            guard let x = (step["x"] as? NSNumber)?.doubleValue,
+                  let y = (step["y"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("scroll step requires x and y coordinates")
+            }
+            let direction = step["direction"] as? String ?? "down"
+            let amount = (step["amount"] as? NSNumber)?.intValue ?? 3
+            let modifiers = step["modifiers"] as? [String] ?? []
+            return try performer.scroll(x: x, y: y, direction: direction, amount: amount, modifiers: modifiers)
+        case "drag":
+            guard let fromX = (step["fromX"] as? NSNumber)?.doubleValue,
+                  let fromY = (step["fromY"] as? NSNumber)?.doubleValue,
+                  let toX = (step["toX"] as? NSNumber)?.doubleValue,
+                  let toY = (step["toY"] as? NSNumber)?.doubleValue else {
+                throw RunnerServiceError.invalidRequest("drag step requires fromX, fromY, toX, toY")
+            }
+            return try performer.dragTo(fromX: fromX, fromY: fromY, toX: toX, toY: toY)
         case "keyPress":
             guard let key = step["key"] as? String, !key.isEmpty else {
                 throw RunnerServiceError.invalidRequest("keyPress step requires key")
             }
             let modifiers = step["modifiers"] as? [String] ?? []
             return try performer.keyPress(key: key, modifiers: modifiers)
+        case "holdKey":
+            guard let key = step["key"] as? String, !key.isEmpty else {
+                throw RunnerServiceError.invalidRequest("holdKey step requires key")
+            }
+            let modifiers = step["modifiers"] as? [String] ?? []
+            let durationMs = (step["durationMs"] as? NSNumber)?.intValue ?? 1000
+            return try performer.holdKey(key: key, modifiers: modifiers, durationMs: durationMs)
         case "delay":
             let ms = (step["ms"] as? NSNumber)?.intValue ?? 1000
             Thread.sleep(forTimeInterval: Double(ms) / 1000.0)
@@ -418,32 +528,229 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
     }
 
     func clickAt(x: Double, y: Double, button: String) throws -> [String: Any] {
+        try clickAt(x: x, y: y, button: button, clickCount: 1, modifiers: [])
+    }
+
+    func clickAt(x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
         #if canImport(ApplicationServices)
         let point = CGPoint(x: x, y: y)
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw RunnerServiceError.executionFailed("failed to create event source")
         }
 
-        let mouseButton: CGMouseButton = button == "right" ? .right : .left
-        let downType: CGEventType = button == "right" ? .rightMouseDown : .leftMouseDown
-        let upType: CGEventType = button == "right" ? .rightMouseUp : .leftMouseUp
-
-        guard let mouseDown = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton) else {
-            throw RunnerServiceError.executionFailed("failed to create mouse down event")
+        let (mouseButton, downType, upType): (CGMouseButton, CGEventType, CGEventType)
+        switch button {
+        case "right":
+            (mouseButton, downType, upType) = (.right, .rightMouseDown, .rightMouseUp)
+        case "middle", "center", "other":
+            (mouseButton, downType, upType) = (.center, .otherMouseDown, .otherMouseUp)
+        default:
+            (mouseButton, downType, upType) = (.left, .leftMouseDown, .leftMouseUp)
         }
-        guard let mouseUp = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton) else {
-            throw RunnerServiceError.executionFailed("failed to create mouse up event")
+
+        let flags = try Self.eventFlags(for: modifiers)
+        let count = max(1, clickCount)
+
+        // A genuine double/triple click is a sequence of down/up pairs with an incrementing
+        // click-state field — posting independent single clicks won't register as a double click.
+        for click in 1...count {
+            guard let mouseDown = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton),
+                  let mouseUp = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton) else {
+                throw RunnerServiceError.executionFailed("failed to create mouse event")
+            }
+            mouseDown.setIntegerValueField(.mouseEventClickState, value: Int64(click))
+            mouseUp.setIntegerValueField(.mouseEventClickState, value: Int64(click))
+            mouseDown.flags = flags
+            mouseUp.flags = flags
+            mouseDown.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.04)
+            mouseUp.post(tap: .cghidEventTap)
+            if click < count { Thread.sleep(forTimeInterval: 0.04) }
         }
 
-        mouseDown.post(tap: .cghidEventTap)
-        Thread.sleep(forTimeInterval: 0.05)
-        mouseUp.post(tap: .cghidEventTap)
-
-        return ["action": "clickAt", "x": x, "y": y, "button": button]
+        return ["action": "clickAt", "x": x, "y": y, "button": button, "clickCount": count, "modifiers": modifiers]
         #else
         throw RunnerServiceError.executionFailed("clickAt is only available on macOS")
         #endif
     }
+
+    func describeElementAt(x: Double, y: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard AXIsProcessTrusted() else {
+            throw RunnerServiceError.executionFailed("Accessibility permission is required")
+        }
+        let systemWide = AXUIElementCreateSystemWide()
+        var elementRef: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(systemWide, Float(x), Float(y), &elementRef)
+        guard result == .success, let element = elementRef else {
+            return ["found": false]
+        }
+
+        var info: [String: Any] = ["found": true]
+        if let role = attributeString(kAXRoleAttribute as CFString, element: element) { info["role"] = role }
+        if let subrole = attributeString(kAXSubroleAttribute as CFString, element: element) { info["subrole"] = subrole }
+        if let title = attributeString(kAXTitleAttribute as CFString, element: element), !title.isEmpty { info["title"] = title }
+        if let identifier = attributeString(kAXIdentifierAttribute as CFString, element: element), !identifier.isEmpty { info["identifier"] = identifier }
+        if let description = attributeString(kAXDescriptionAttribute as CFString, element: element), !description.isEmpty { info["description"] = description }
+        return info
+        #else
+        throw RunnerServiceError.executionFailed("describeElementAt is only available on macOS")
+        #endif
+    }
+
+    func clickElement(selector: [String: Any], x: Double, y: Double, button: String, clickCount: Int, modifiers: [String]) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        // Prefer the element: if the selector still resolves, click its current center so the click
+        // follows the element even if the layout shifted. Otherwise fall back to the captured point.
+        if let element = try? resolveElement(selector: selector), let center = Self.elementCenter(element) {
+            var result = try clickAt(x: center.x, y: center.y, button: button, clickCount: clickCount, modifiers: modifiers)
+            result["resolvedBy"] = "selector"
+            return result
+        }
+        var result = try clickAt(x: x, y: y, button: button, clickCount: clickCount, modifiers: modifiers)
+        result["resolvedBy"] = "coordinate"
+        return result
+        #else
+        throw RunnerServiceError.executionFailed("clickElement is only available on macOS")
+        #endif
+    }
+
+    #if canImport(ApplicationServices)
+    /// Center of an AX element in global points, from its AXPosition + AXSize.
+    private static func elementCenter(_ element: AXUIElement) -> CGPoint? {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posValue = posRef, let sizeValue = sizeRef else {
+            return nil
+        }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posValue as! AXValue, .cgPoint, &point),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
+              size.width > 0, size.height > 0 else {
+            return nil
+        }
+        return CGPoint(x: point.x + size.width / 2, y: point.y + size.height / 2)
+    }
+    #endif
+
+    func moveMouse(x: Double, y: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left) else {
+            throw RunnerServiceError.executionFailed("failed to create mouse move event")
+        }
+        move.post(tap: .cghidEventTap)
+        return ["action": "moveMouse", "x": x, "y": y]
+        #else
+        throw RunnerServiceError.executionFailed("moveMouse is only available on macOS")
+        #endif
+    }
+
+    func typeText(text: String) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+        // Drive real keystrokes via a synthesized Unicode key event. Unlike AX value-set, this
+        // reaches web inputs and any focused control. Chunk to stay within the per-event buffer.
+        let scalars = Array(text.utf16)
+        let chunkSize = 20
+        var index = 0
+        while index < scalars.count {
+            let chunk = Array(scalars[index..<min(index + chunkSize, scalars.count)])
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                throw RunnerServiceError.executionFailed("failed to create keyboard event")
+            }
+            keyDown.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            keyUp.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.01)
+            index += chunkSize
+        }
+        return ["action": "typeText", "length": scalars.count]
+        #else
+        throw RunnerServiceError.executionFailed("typeText is only available on macOS")
+        #endif
+    }
+
+    func scroll(x: Double, y: Double, direction: String, amount: Int, modifiers: [String]) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+        // Position the cursor over the target first so the scroll lands in the right view.
+        if let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left) {
+            move.post(tap: .cghidEventTap)
+        }
+
+        // Each "amount" unit is a few scroll lines. Vertical → wheel1, horizontal → wheel2.
+        let lines = Int32(max(1, amount) * 3)
+        var wheel1: Int32 = 0
+        var wheel2: Int32 = 0
+        switch direction.lowercased() {
+        case "up": wheel1 = lines
+        case "down": wheel1 = -lines
+        case "left": wheel2 = lines
+        case "right": wheel2 = -lines
+        default: throw RunnerServiceError.invalidRequest("unknown scroll direction: \(direction)")
+        }
+
+        guard let scrollEvent = CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: wheel1, wheel2: wheel2, wheel3: 0) else {
+            throw RunnerServiceError.executionFailed("failed to create scroll event")
+        }
+        scrollEvent.flags = try Self.eventFlags(for: modifiers)
+        scrollEvent.post(tap: .cghidEventTap)
+        return ["action": "scroll", "direction": direction, "amount": amount]
+        #else
+        throw RunnerServiceError.executionFailed("scroll is only available on macOS")
+        #endif
+    }
+
+    func dragTo(fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw RunnerServiceError.executionFailed("failed to create event source")
+        }
+        let start = CGPoint(x: fromX, y: fromY)
+        let end = CGPoint(x: toX, y: toY)
+        guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left),
+              let drag = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: end, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left) else {
+            throw RunnerServiceError.executionFailed("failed to create drag event")
+        }
+        down.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.05)
+        drag.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.05)
+        up.post(tap: .cghidEventTap)
+        return ["action": "dragTo", "fromX": fromX, "fromY": fromY, "toX": toX, "toY": toY]
+        #else
+        throw RunnerServiceError.executionFailed("dragTo is only available on macOS")
+        #endif
+    }
+
+    #if canImport(ApplicationServices)
+    /// Maps modifier names (cmd/shift/alt/ctrl, plus the computer-use `super` alias for Command)
+    /// to CGEventFlags. Shared by click and scroll.
+    static func eventFlags(for modifiers: [String]) throws -> CGEventFlags {
+        var flags: CGEventFlags = []
+        for mod in modifiers {
+            switch mod.lowercased() {
+            case "cmd", "command", "super", "meta": flags.insert(.maskCommand)
+            case "shift": flags.insert(.maskShift)
+            case "alt", "option": flags.insert(.maskAlternate)
+            case "ctrl", "control": flags.insert(.maskControl)
+            default: throw RunnerServiceError.invalidRequest("unknown modifier: \(mod)")
+            }
+        }
+        return flags
+    }
+    #endif
 
     func setTextFocused(value: String) throws -> [String: Any] {
         #if canImport(ApplicationServices)
@@ -473,16 +780,7 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             throw RunnerServiceError.invalidRequest("unknown key: \(key)")
         }
 
-        var flags: CGEventFlags = []
-        for mod in modifiers {
-            switch mod.lowercased() {
-            case "cmd", "command": flags.insert(.maskCommand)
-            case "shift": flags.insert(.maskShift)
-            case "alt", "option": flags.insert(.maskAlternate)
-            case "ctrl", "control": flags.insert(.maskControl)
-            default: throw RunnerServiceError.invalidRequest("unknown modifier: \(mod)")
-            }
-        }
+        let flags = try Self.eventFlags(for: modifiers)
 
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw RunnerServiceError.executionFailed("failed to create event source")
@@ -504,6 +802,28 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
         return ["action": "keyPress", "key": key, "modifiers": modifiers]
         #else
         throw RunnerServiceError.executionFailed("keyPress is only available on macOS")
+        #endif
+    }
+
+    func holdKey(key: String, modifiers: [String], durationMs: Int) throws -> [String: Any] {
+        #if canImport(ApplicationServices)
+        guard let keyCode = keyCodeForName(key) else {
+            throw RunnerServiceError.invalidRequest("unknown key: \(key)")
+        }
+        let flags = try Self.eventFlags(for: modifiers)
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+            throw RunnerServiceError.executionFailed("failed to create keyboard event")
+        }
+        keyDown.flags = flags
+        keyUp.flags = flags
+        keyDown.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: Double(max(0, durationMs)) / 1000.0)
+        keyUp.post(tap: .cghidEventTap)
+        return ["action": "holdKey", "key": key, "modifiers": modifiers, "durationMs": durationMs]
+        #else
+        throw RunnerServiceError.executionFailed("holdKey is only available on macOS")
         #endif
     }
 
@@ -795,22 +1115,87 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
 
     func takeScreenshot(quality: Double) throws -> [String: Any] {
         #if canImport(ApplicationServices) && canImport(ImageIO) && canImport(UniformTypeIdentifiers)
-        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else {
-            throw RunnerServiceError.executionFailed("failed to capture screenshot")
+        // Composite every active display into one image so the agent sees all monitors at once,
+        // rather than guessing which display is "active". The model's coordinates map back to the
+        // global click space via originX/originY (virtual-desktop top-left, in points) and
+        // pointScale (points per image pixel): global = origin + imageCoord * pointScale.
+        var displayCount: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &displayCount) == .success, displayCount > 0 else {
+            throw RunnerServiceError.executionFailed("failed to enumerate displays")
         }
+        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        guard CGGetActiveDisplayList(displayCount, &displayIDs, &displayCount) == .success else {
+            throw RunnerServiceError.executionFailed("failed to list displays")
+        }
+
+        // Capture each display and accumulate the union of their global bounds (in points).
+        var captures: [(image: CGImage, bounds: CGRect)] = []
+        var minX = Double.greatestFiniteMagnitude
+        var minY = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude
+        var maxY = -Double.greatestFiniteMagnitude
+        for id in displayIDs {
+            guard let img = CGDisplayCreateImage(id) else { continue }
+            let b = CGDisplayBounds(id)
+            captures.append((img, b))
+            minX = min(minX, Double(b.minX)); minY = min(minY, Double(b.minY))
+            maxX = max(maxX, Double(b.maxX)); maxY = max(maxY, Double(b.maxY))
+        }
+        guard !captures.isEmpty else {
+            throw RunnerServiceError.executionFailed("failed to capture any display")
+        }
+
+        // Downscale the whole virtual desktop so the long edge stays within the vision limit.
+        let unionWidth = maxX - minX
+        let unionHeight = maxY - minY
+        let maxEdge = 2560.0
+        let longEdge = max(unionWidth, unionHeight)
+        let canvasScale = longEdge > maxEdge ? maxEdge / longEdge : 1.0
+        let imageWidth = max(1, Int((unionWidth * canvasScale).rounded()))
+        let imageHeight = max(1, Int((unionHeight * canvasScale).rounded()))
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil, width: imageWidth, height: imageHeight, bitsPerComponent: 8,
+            bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw RunnerServiceError.executionFailed("failed to create composite context")
+        }
+        context.interpolationQuality = .high
+        context.setFillColor(gray: 0, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+
+        // CGContext has a bottom-left origin; display bounds are in a top-left, y-down global
+        // space. Convert each display's top edge into the context's bottom-left rect. CGContext
+        // scales the physical-pixel capture into the logical-sized rect automatically.
+        for capture in captures {
+            let b = capture.bounds
+            let x = (Double(b.minX) - minX) * canvasScale
+            let topFromTop = (Double(b.minY) - minY) * canvasScale
+            let w = Double(b.width) * canvasScale
+            let h = Double(b.height) * canvasScale
+            let y = Double(imageHeight) - topFromTop - h
+            context.draw(capture.image, in: CGRect(x: x, y: y, width: w, height: h))
+        }
+
+        guard let image = context.makeImage() else {
+            throw RunnerServiceError.executionFailed("failed to render composite image")
+        }
+
+        let pointScale = imageWidth > 0 ? unionWidth / Double(imageWidth) : 1.0
+        let first = captures[0]
+        let backingScale = first.bounds.width > 0 ? Double(first.image.width) / Double(first.bounds.width) : 1.0
 
         let data = NSMutableData()
         let jpegType = UTType.jpeg.identifier as CFString
         guard let destination = CGImageDestinationCreateWithData(data, jpegType, 1, nil) else {
             throw RunnerServiceError.executionFailed("failed to create JPEG destination")
         }
-
         let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
         CGImageDestinationAddImage(destination, image, options as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {
             throw RunnerServiceError.executionFailed("failed to finalize JPEG encoding")
         }
-
         let base64 = (data as Data).base64EncodedString()
 
         return [
@@ -818,10 +1203,94 @@ struct LiveRunnerActionPerformer: RunnerActionPerforming {
             "base64": base64,
             "width": image.width,
             "height": image.height,
+            "originX": minX,
+            "originY": minY,
+            "pointScale": pointScale,
+            "scale": backingScale,
+            "displayCount": captures.count,
             "format": "jpeg",
         ]
         #else
         throw RunnerServiceError.executionFailed("screenshot is only available on macOS")
+        #endif
+    }
+
+    func zoomCapture(x: Double, y: Double, width: Double, height: Double, quality: Double) throws -> [String: Any] {
+        #if canImport(ApplicationServices) && canImport(ImageIO) && canImport(UniformTypeIdentifiers)
+        // x/y/width/height are in global points. Capture the display containing the region center
+        // at full physical resolution and crop to the requested rect, so the model can read fine
+        // detail (e.g. faded vs. regular text) that is lost in the downscaled full-desktop image.
+        let center = CGPoint(x: x + width / 2, y: y + height / 2)
+        var ids = [CGDirectDisplayID](repeating: 0, count: 1)
+        var matching: UInt32 = 0
+        let displayID: CGDirectDisplayID
+        if CGGetDisplaysWithPoint(center, 1, &ids, &matching) == .success, matching > 0, ids[0] != 0 {
+            displayID = ids[0]
+        } else {
+            displayID = CGMainDisplayID()
+        }
+        guard let full = CGDisplayCreateImage(displayID) else {
+            throw RunnerServiceError.executionFailed("failed to capture display for zoom")
+        }
+        let bounds = CGDisplayBounds(displayID)
+        let backing = bounds.width > 0 ? Double(full.width) / Double(bounds.width) : 1.0
+
+        // Convert the global-point rect into the capture's physical pixels (top-left origin),
+        // clamped to the image bounds.
+        let px = max(0.0, (x - Double(bounds.minX)) * backing)
+        let py = max(0.0, (y - Double(bounds.minY)) * backing)
+        let pw = min(width * backing, Double(full.width) - px)
+        let ph = min(height * backing, Double(full.height) - py)
+        guard pw >= 1, ph >= 1,
+              let cropped = full.cropping(to: CGRect(x: px, y: py, width: pw, height: ph)) else {
+            throw RunnerServiceError.executionFailed("zoom region is outside the display")
+        }
+
+        // Cap the long edge so the zoomed image stays a reasonable size.
+        let maxEdge = 1536
+        let longEdge = max(cropped.width, cropped.height)
+        let outImage: CGImage
+        if longEdge > maxEdge {
+            let factor = Double(maxEdge) / Double(longEdge)
+            let w = max(1, Int((Double(cropped.width) * factor).rounded()))
+            let h = max(1, Int((Double(cropped.height) * factor).rounded()))
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            guard let ctx = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                throw RunnerServiceError.executionFailed("failed to create zoom context")
+            }
+            ctx.interpolationQuality = .high
+            ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: w, height: h))
+            guard let scaled = ctx.makeImage() else {
+                throw RunnerServiceError.executionFailed("failed to scale zoom image")
+            }
+            outImage = scaled
+        } else {
+            outImage = cropped
+        }
+
+        let data = NSMutableData()
+        let jpegType = UTType.jpeg.identifier as CFString
+        guard let destination = CGImageDestinationCreateWithData(data, jpegType, 1, nil) else {
+            throw RunnerServiceError.executionFailed("failed to create JPEG destination")
+        }
+        CGImageDestinationAddImage(destination, outImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw RunnerServiceError.executionFailed("failed to finalize zoom JPEG")
+        }
+        let base64 = (data as Data).base64EncodedString()
+
+        return [
+            "action": "zoom",
+            "base64": base64,
+            "width": outImage.width,
+            "height": outImage.height,
+            "format": "jpeg",
+        ]
+        #else
+        throw RunnerServiceError.executionFailed("zoom is only available on macOS")
         #endif
     }
 }
@@ -960,20 +1429,51 @@ private func keyCodeForName(_ name: String) -> CGKeyCode? {
     case "k": return 40
     case "n": return 45
     case "m": return 46
-    case "return", "enter": return 36
+    case "return", "enter", "kp_enter": return 36
     case "tab": return 48
     case "space": return 49
+    // Modifier keys as standalone keys (e.g. hold_key "cmd"). Modifiers passed in the `modifiers`
+    // array are handled separately via event flags; this is for pressing/holding the key itself.
+    case "command", "cmd", "super", "meta": return 55
+    case "shift", "left_shift": return 56
+    case "capslock", "caps_lock": return 57
+    case "option", "alt", "left_alt": return 58
+    case "control", "ctrl", "left_control": return 59
+    case "function", "fn": return 63
     case "delete", "backspace": return 51
+    case "forward_delete", "forwarddelete": return 117
     case "escape", "esc": return 53
     case "left": return 123
     case "right": return 124
     case "down": return 125
     case "up": return 126
+    case "home": return 115
+    case "end": return 119
+    case "page_up", "pageup", "prior": return 116
+    case "page_down", "pagedown", "next": return 121
+    case "minus": return 27
+    case "equal", "equals": return 24
+    case "slash": return 44
+    case "period", "dot": return 47
+    case "comma": return 43
+    case "semicolon": return 41
+    case "quote", "apostrophe": return 39
+    case "backslash": return 42
+    case "leftbracket", "left_bracket": return 33
+    case "rightbracket", "right_bracket": return 30
+    case "grave", "backtick": return 50
     case "f1": return 122
     case "f2": return 120
     case "f3": return 99
     case "f4": return 118
     case "f5": return 96
+    case "f6": return 97
+    case "f7": return 98
+    case "f8": return 100
+    case "f9": return 101
+    case "f10": return 109
+    case "f11": return 103
+    case "f12": return 111
     default: return nil
     }
 }
