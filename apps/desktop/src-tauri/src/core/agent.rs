@@ -18,13 +18,14 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 // the runner already hands us logical-point screenshots that match the click coordinate space.
 const ANTHROPIC_BETA: &str = "computer-use-2025-11-24";
 const COMPUTER_TOOL_TYPE: &str = "computer_20251124";
-// Thinking depth / token spend. `high` favours reliability over latency for autonomous control.
-const EFFORT: &str = "high";
+// Thinking depth / token spend. `medium` is the sweet spot for GUI automation — enough reasoning
+// to act reliably, far faster and cheaper than `high` across a long step loop.
+const EFFORT: &str = "medium";
 const MAX_RESPONSE_TOKENS: u32 = 8192;
 
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(6);
-const DEFAULT_MAX_STEPS: u32 = 50;
+const DEFAULT_MAX_STEPS: u32 = 120;
 const ACTION_SETTLE_MS: u64 = 400;
 const MAX_RECORDING_KEYFRAMES: usize = 4;
 // Keep only the most recent screenshots in the conversation. Older ones are replaced with a text
@@ -53,7 +54,12 @@ pub enum AgentEvent {
 }
 
 pub struct AgentConfig {
-    pub session_id: i64,
+    /// A recorded session to use as a demonstration, if any. `None` runs from `task` alone — the
+    /// agent explores the live screen with no recording ("you don't need to hit record").
+    pub session_id: Option<i64>,
+    /// Explicit task description. Required when `session_id` is `None`; otherwise it overrides the
+    /// recorded session's description when provided.
+    pub task: Option<String>,
     pub max_steps: u32,
     pub api_key: String,
     pub cancel_token: Arc<AtomicBool>,
@@ -94,16 +100,30 @@ pub fn run_agent<F>(
 where
     F: Fn(AgentEvent) + Send,
 {
-    let session = storage.get_session(config.session_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("session {} not found", config.session_id))?;
-
-    let events = storage
-        .list_raw_events_for_session(config.session_id, 200)
-        .map_err(|e| e.to_string())?;
-
-    let recording_summary = build_recording_summary(&session, &events);
-    let recording_keyframes = load_recording_keyframes(&events);
+    // Resolve the task and (optional) recording. With no session, the agent works from the task
+    // description alone and discovers the rest by looking at the live screen.
+    let (task, recording_summary, recording_keyframes) = match config.session_id {
+        Some(sid) => {
+            let session = storage.get_session(sid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("session {sid} not found"))?;
+            let events = storage
+                .list_raw_events_for_session(sid, 200)
+                .map_err(|e| e.to_string())?;
+            let task = config.task.clone()
+                .or_else(|| session.description.clone())
+                .unwrap_or_else(|| "(no task description provided)".to_string());
+            let summary = build_recording_summary(&session, &events);
+            let keyframes = load_recording_keyframes(&events);
+            (task, Some(summary), keyframes)
+        }
+        None => {
+            let task = config.task.clone()
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| "a task description is required when running without a recording".to_string())?;
+            (task, None, Vec::new())
+        }
+    };
 
     let mut runner = RunnerBridge::spawn(runner_binary)
         .map_err(|e| format!("failed to start runner: {e}"))?;
@@ -136,7 +156,7 @@ where
     let system_prompt = build_system_prompt();
 
     // Seed the conversation with the task, the recording walkthrough, and the live screen.
-    let mut first_content = build_first_user_message(&session, &recording_summary, &recording_keyframes);
+    let mut first_content = build_first_user_message(&task, recording_summary.as_deref(), &recording_keyframes);
     first_content.push(json!({"type": "text", "text": "\nHere is the current state of the screen:"}));
     first_content.push(image_block(&initial.base64));
     first_content.push(json!({"type": "text", "text":
@@ -706,10 +726,11 @@ fn load_recording_keyframes(events: &[RawEventRecord]) -> Vec<(String, String)> 
 fn build_system_prompt() -> String {
     r#"You are a macOS desktop automation agent. You control the computer with the `computer` tool — taking screenshots and issuing mouse and keyboard actions to complete a task.
 
-You have been shown a recording of the user performing this task manually. Use it as a guide for the goal and the rough sequence of steps, but always adapt to what you actually see on screen — windows, positions, and content may differ from the recording.
+You may have been shown a recording of the user performing this task manually. If a recording walkthrough is included below, use it as a guide for the goal and the rough sequence of steps — but always adapt to what you actually see on screen (windows, positions, and content may differ). If no recording is included, work the task out from the description and what you see on screen.
 
 RULES:
 - Take ONE action at a time, then look at the resulting screenshot before deciding the next action.
+- A fresh screenshot is returned automatically after every action — you do NOT need to call the `screenshot` action just to see the result. Only screenshot to re-check the screen when you did not act. Be decisive and avoid redundant moves; every action is a slow round-trip.
 - Coordinates are in the screenshot's pixel space; click precisely on the element you can see.
 - The screenshot shows ALL of the user's displays composited side by side, so it may be a wide image spanning multiple monitors (black regions are gaps between displays). Scan the whole image — the window you need may be on a different monitor than you expect, not just the left portion.
 - Because the image spans all monitors it is downscaled, so small text can be hard to read. When you need to read fine detail to make a decision (e.g. distinguishing enabled vs. disabled or active vs. faded/archived items, small labels), use the `zoom` action on that region first to see it at full resolution, then act.
@@ -722,16 +743,17 @@ RULES:
 }
 
 fn build_first_user_message(
-    session: &SessionRecord,
-    recording_summary: &str,
+    task: &str,
+    recording_summary: Option<&str>,
     keyframes: &[(String, String)],
 ) -> Vec<Value> {
     let mut content: Vec<Value> = Vec::new();
 
-    let description = session.description.as_deref().unwrap_or("(no description provided)");
-    content.push(json!({"type": "text", "text": format!(
-        "## Task\n\n{description}\n\n## How I did it when I recorded it\n\n{recording_summary}"
-    )}));
+    let mut intro = format!("## Task\n\n{task}");
+    if let Some(summary) = recording_summary {
+        intro.push_str(&format!("\n\n## How I did it when I recorded it\n\n{summary}"));
+    }
+    content.push(json!({"type": "text", "text": intro}));
 
     if !keyframes.is_empty() {
         content.push(json!({"type": "text", "text": "\n## Key moments from my recording:"}));

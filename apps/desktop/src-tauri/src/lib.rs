@@ -24,6 +24,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::agent::start_agent,
+            commands::agent::start_agent_from_task,
             commands::agent::stop_agent,
             commands::ai::ai_compile_workflow,
             commands::ai::ai_refine_workflow,

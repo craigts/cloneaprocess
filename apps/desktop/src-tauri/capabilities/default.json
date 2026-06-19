@@ -8,6 +8,7 @@
     "core:window:default",
     "core:app:default",
     "allow-start-agent",
+    "allow-start-agent-from-task",
     "allow-stop-agent",
     "allow-ai-compile-workflow",
     "allow-ai-refine-workflow",

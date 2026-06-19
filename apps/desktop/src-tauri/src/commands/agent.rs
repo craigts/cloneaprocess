@@ -18,12 +18,40 @@ impl AgentState {
     }
 }
 
+/// Run the agent against a recorded session (using it as a demonstration).
 #[tauri::command]
 pub fn start_agent(
     app: AppHandle,
     state: State<'_, AppState>,
     agent_state: State<'_, AgentState>,
     session_id: i64,
+    max_steps: Option<u32>,
+) -> Result<(), String> {
+    spawn_agent(app, state, agent_state, Some(session_id), None, max_steps)
+}
+
+/// Run the agent from a natural-language task alone, with no recording — the agent explores the
+/// live screen to figure out how. ("You don't need to hit record.")
+#[tauri::command]
+pub fn start_agent_from_task(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_state: State<'_, AgentState>,
+    task: String,
+    max_steps: Option<u32>,
+) -> Result<(), String> {
+    if task.trim().is_empty() {
+        return Err("Describe what you want the agent to do.".to_string());
+    }
+    spawn_agent(app, state, agent_state, None, Some(task), max_steps)
+}
+
+fn spawn_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_state: State<'_, AgentState>,
+    session_id: Option<i64>,
+    task: Option<String>,
     max_steps: Option<u32>,
 ) -> Result<(), String> {
     // Check if agent is already running
@@ -50,7 +78,8 @@ pub fn start_agent(
 
     let config = AgentConfig {
         session_id,
-        max_steps: max_steps.unwrap_or(50),
+        task,
+        max_steps: max_steps.unwrap_or(0), // 0 → agent's DEFAULT_MAX_STEPS
         api_key,
         cancel_token,
     };
