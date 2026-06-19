@@ -653,7 +653,7 @@ You have been shown a recording of the user performing this task manually. Use i
 RULES:
 - Take ONE action at a time, then look at the resulting screenshot before deciding the next action.
 - Coordinates are in the screenshot's pixel space; click precisely on the element you can see.
-- The screenshot shows the display that currently holds the active window. The user may have multiple monitors, so when you switch or open an app the view may "jump" to a different screen — that is expected; just work with whatever the latest screenshot shows.
+- The screenshot shows ALL of the user's displays composited side by side, so it may be a wide image spanning multiple monitors (black regions are gaps between displays). Scan the whole image — the window you need may be on a different monitor than you expect, not just the left portion.
 - After navigating or opening something, use the `wait` action to let the UI load before acting.
 - Prefer keyboard shortcuts where they are reliable (e.g. cmd+t new tab, cmd+l address bar, cmd+c/cmd+v).
 - To type into a field, click it first, then use the `type` action.
